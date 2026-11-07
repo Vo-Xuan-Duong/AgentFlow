@@ -16,7 +16,7 @@ Lightweight, local-first Windows CLI to coordinate **Codex CLI (planner/reviewer
 ```powershell
 git clone https://github.com/Vo-Xuan-Duong/AgentFlow.git
 cd AgentFlow
-git switch feat/rust-orchestrator
+git switch main
 cargo build --release
 .\target\release\agentflow.exe --help
 ```
@@ -59,7 +59,7 @@ On any ambiguous agent outcome, the state becomes `needs_attention`. Validation 
 - `agy -p` behavior, headless approval prompts and CLI authentication differ across versions; check `agy --help`. A process exit code of zero **does not prove all requested changes were implemented**.
 - Initial output validation checks only for changed files, certain permission-related phrases and a stable base commit. Review agent output and the diff manually.
 - Codex review is written to `review.md`; it does **not** automatically approve changes. The human decision is the final gate.
-- The MVP is sequential, without persistent process sessions, cancellation, automatic code-fix loops or an interactive dashboard.
+- The MVP is sequential, without persistent sessions, automatic code-fix loops or an interactive dashboard. It now supports per-task cancellation requests, bounded subprocess execution and manual interruption recovery.
 - This prototype allows user-configured check commands. Only enter commands you understand; run them in a safe repo.
 
 ## Windows CI
@@ -70,6 +70,40 @@ On any ambiguous agent outcome, the state becomes `needs_attention`. Validation 
 
 1. Verify agent CLI flags against current locally installed versions.
 2. Add structured agent JSON events and robust permission-denial detection.
-3. Add process timeout/cancellation and Windows Job Object-based subprocess termination.
-4. Add deterministic review-gate schema and state recovery after interrupted runs.
+3. Verify Windows Job Object behavior and agent CLI compatibility in a disposable repository.
+4. Add a deterministic review-gate schema and explicit retry workflow.
 5. Add `ratatui` TUI and optional multi-task scheduling after the CLI is stable.
+
+## Process supervision and recovery
+
+Planner, executor, validations and reviewer run through a bounded process supervisor.
+Set `AGENTFLOW_TIMEOUT_SECONDS` (1 to 86400; default 1800) before starting a phase.
+On Windows, a Job Object with `KILL_ON_JOB_CLOSE` prevents supervised
+descendants from surviving if AgentFlow exits. Non-Windows builds only kill
+the direct subprocess.
+
+From a second terminal, request cooperative cancellation:
+
+```powershell
+& $af cancel --task $task
+```
+
+The executing process polls and stops its subprocess tree. The task moves to
+`needs_attention` (or `validation_failed` for validation). State, logs and
+the worktree are retained for manual review.
+
+After a crash or power failure, first ensure the original process has exited:
+
+```powershell
+& $af recover --task $task
+& $af status --task $task
+```
+
+Recovery acquires the per-task file lock and moves interrupted phases to
+`needs_attention`. It never retries an agent command, resets Git, or deletes
+files. Inspect the worktree and logs before starting a new task.
+
+JSON state writes use a temporary file and a backup for safer replacement.
+`status` reports the last captured phase error. The lock coordinates
+AgentFlow invocations, not external tools. Windows nested Job Objects and
+launcher behavior require real-machine testing. This is not a security sandbox.
