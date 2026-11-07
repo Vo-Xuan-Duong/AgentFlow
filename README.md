@@ -73,3 +73,42 @@ On any ambiguous agent outcome, the state becomes `needs_attention`. Validation 
 3. Add process timeout/cancellation and Windows Job Object-based subprocess termination.
 4. Add deterministic review-gate schema and state recovery after interrupted runs.
 5. Add `ratatui` TUI and optional multi-task scheduling after the CLI is stable.
+
+## Codex Desktop as controller, Antigravity as code executor
+
+Codex Desktop can be the user-facing chat and planner while AgentFlow calls
+Antigravity to edit the code. The repository includes a project-local skill:
+`.agents/skills/delegate-to-antigravity/SKILL.md`. Open this repository
+in Codex Desktop and explicitly request the `delegate-to-antigravity` skill.
+Codex Desktop needs terminal permissions to run the installed AgentFlow CLI.
+
+The usual `start --request` flow still uses Codex CLI to produce a plan.
+For a plan **already written by Codex Desktop**, use `--plan-file` to avoid
+paying for a second Codex planning run:
+
+```powershell
+# Use an absolute path to a real, reviewed Markdown plan produced in Codex Desktop.
+$plan = 'C:\path\to\approved-plan.md'
+$af = 'C:\path\to\AgentFlow\target\release\agentflow.exe'
+$targetRepo = 'C:\path\to\your-project'
+& $af --repo $targetRepo doctor
+& $af --repo $targetRepo start --request 'Implement the reviewed plan' --plan-file $plan
+# Read the real task ID printed above; never use a placeholder with approve/run.
+& $af --repo $targetRepo status --task '<actual-task-id>'
+# Explicitly review and approve the plan before executing:
+& $af --repo $targetRepo approve --task '<actual-task-id>'
+& $af --repo $targetRepo run --task '<actual-task-id>'
+```
+
+The imported file must be valid UTF-8, 100+ non-whitespace characters,
+and no larger than 1 MiB. AgentFlow copies it into the task artifact
+directory and records its digest at approval; it refuses to run if the
+approved plan changes. **Importing a plan is not approving it.**
+
+The executor remains `agy`; AgentFlow never silently substitutes Codex
+for code edits. Worktrees are not security sandboxes. Finish with
+`validate`, `review`, and human inspection of the Git diff. No auto-merge.
+
+**Important:** This integrates through the terminal/skill workflow; it does
+not add a built-in graphical button to Codex Desktop. Actual agent CLI
+flags, authentication and permissions must be validated on your machine.
