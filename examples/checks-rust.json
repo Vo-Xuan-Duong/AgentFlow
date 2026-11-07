@@ -1,0 +1,6 @@
+{
+  "checks": [
+    {"name": "format", "program": "cargo", "args": ["fmt", "--all", "--", "--check"]},
+    {"name": "test", "program": "cargo", "args": ["test", "--all"]}
+  ]
+}
