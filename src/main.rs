@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::{
-    env, fs,
+    fs,
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
