@@ -232,7 +232,7 @@ struct TaskLock {
 
 impl TaskLock {
     fn acquire(root: &Path, id: &str) -> Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).create(true)
+        let file = OpenOptions::new().read(true).write(true).create(true).truncate(false)
             .open(task_dir(root, id)?.join("task.lock"))?;
         file.try_lock().context("another AgentFlow command is already operating on this task")?;
         Ok(Self { file })
