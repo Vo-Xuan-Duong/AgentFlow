@@ -37,6 +37,8 @@ struct Task {
     worktree: PathBuf,
     branch: String,
     base: String,
+    #[serde(default)]
+    approved_plan_hash: Option<String>,
     state: String,
 }
 
@@ -103,6 +105,52 @@ fn task_dir(root: &Path, id: &str) -> Result<PathBuf> {
         bail!("invalid task id");
     }
     Ok(state_root(root)?.join(id))
+}
+
+// Hash the exact approved plan bytes using Git's object hash algorithm.
+fn plan_digest(root: &Path, plan: &str) -> Result<String> {
+    let mut c = command("git", root);
+    c.args(["hash-object", "--stdin"]);
+    c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = c.spawn().context("could not start git hash-object")?;
+    child.stdin.take().context("missing hash stdin")?.write_all(plan.as_bytes())?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        bail!("could not hash plan: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+fn verify_plan_hash(approved: Option<&str>, actual: &str) -> Result<()> {
+    let expected = approved.context("no approved plan hash recorded; start a new task")?;
+    if expected != actual {
+        bail!("plan.md changed after approval; refusing to execute a different plan");
+    }
+    Ok(())
+}
+
+fn verify_agy_result(output: &str) -> Result<()> {
+    let result: serde_json::Value = serde_json::from_str(output)
+        .context("Antigravity did not emit JSON; check agy CLI version and executor logs")?;
+    let status = result.get("status").and_then(serde_json::Value::as_str).unwrap_or("missing");
+    if status != "SUCCESS" {
+        bail!("Antigravity reported status {status}; inspect executor logs");
+    }
+    Ok(())
+}
+
+fn has_permission_issue(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    [
+        "soft-denied",
+        "soft denied",
+        "permission denied",
+        "approval required",
+        "requires approval",
+        "authentication required",
+    ]
+    .iter()
+    .any(|term| stderr.contains(term))
 }
 
 fn load(root: &Path, id: &str) -> Result<Task> {
@@ -173,7 +221,7 @@ fn start(root: &Path, request: String) -> Result<()> {
     let mut c = command("git", root);
     c.args(["worktree", "add", "-b", &branch]).arg(&wt).arg(&base);
     run_logged(c, &dir, "worktree", None)?;
-    let mut task = Task { id, request, root: root.to_owned(), worktree: wt, branch, base, state: "planning".into() };
+    let mut task = Task { id, request, root: root.to_owned(), worktree: wt, branch, base, approved_plan_hash: None, state: "planning".into() };
     save(&task)?;
     fs::write(dir.join("checks.json"), "{\n  \"checks\": []\n}\n")?;
     let prompt = format!(
@@ -204,7 +252,11 @@ fn start(root: &Path, request: String) -> Result<()> {
 fn approve(root: &Path, id: &str) -> Result<()> {
     let mut task = load(root, id)?;
     require(&task, "planned")?;
-    println!("Approving plan at {}", task_dir(root, id)?.join("plan.md").display());
+    let plan_path = task_dir(root, id)?.join("plan.md");
+    let plan = fs::read_to_string(&plan_path)?;
+    if plan.len() < 100 { bail!("plan.md is too short to approve"); }
+    task.approved_plan_hash = Some(plan_digest(root, &plan)?);
+    println!("Approving plan at {}", plan_path.display());
     task.state = "approved".into();
     save(&task)
 }
@@ -214,6 +266,7 @@ fn run(root: &Path, id: &str) -> Result<()> {
     require(&task, "approved")?;
     let dir = task_dir(root, id)?;
     let plan = fs::read_to_string(dir.join("plan.md"))?;
+    verify_plan_hash(task.approved_plan_hash.as_deref(), &plan_digest(root, &plan)?)?;
     task.state = "executing".into();
     save(&task)?;
     let prompt = format!(
@@ -223,20 +276,32 @@ fn run(root: &Path, id: &str) -> Result<()> {
         Finish with changed files and test outcomes.\n\nAPPROVED PLAN:\n{plan}"
     );
     let mut c = command("agy", &task.worktree);
-    c.args(["-p", &prompt]);
+    c.args(["-p", &prompt, "--output-format", "json", "--print-timeout", "30m"]);
     if let Err(e) = run_logged(c, &dir, "executor", None) {
         task.state = "needs_attention".into();
         save(&task)?;
         return Err(e);
     }
-    let head = git(&task.worktree, &["rev-parse", "HEAD"])?;
-    let changes = git(&task.worktree, &["status", "--porcelain"])?;
-    let log = fs::read_to_string(dir.join("executor.stdout.log")).unwrap_or_default().to_lowercase();
-    if head != task.base || changes.is_empty()
-        || log.contains("approval required") || log.contains("permission denied") || log.contains("soft-denied") {
+    // A headless invocation may exit 0 even when an action was soft-denied.
+    // Any post-execution inspection error must leave a recoverable task state.
+    let inspected = (|| -> Result<()> {
+        let stdout = fs::read_to_string(dir.join("executor.stdout.log"))?;
+        let stderr = fs::read_to_string(dir.join("executor.stderr.log"))?;
+        verify_agy_result(&stdout)?;
+        if has_permission_issue(&stderr) {
+            bail!("Antigravity reported an approval or authentication problem in stderr");
+        }
+        let head = git(&task.worktree, &["rev-parse", "HEAD"])?;
+        let changes = git(&task.worktree, &["status", "--porcelain"])?;
+        if head != task.base || changes.is_empty() {
+            bail!("executor outcome needs inspection: no changes or unexpected commit");
+        }
+        Ok(())
+    })();
+    if let Err(e) = inspected {
         task.state = "needs_attention".into();
         save(&task)?;
-        bail!("executor outcome needs inspection: no changes, permission issue or unexpected commit");
+        return Err(e);
     }
     task.state = "executed".into();
     save(&task)?;
@@ -250,10 +315,12 @@ fn validate(root: &Path, id: &str) -> Result<()> {
     let dir = task_dir(root, id)?;
     let config: Checks = serde_json::from_slice(&fs::read(dir.join("checks.json"))?)?;
     if config.checks.is_empty() { bail!("checks.json is empty; configure actual tests before validation"); }
+    if config.checks.iter().any(|check| check.name.trim().is_empty() || check.program.trim().is_empty()) {
+        bail!("checks.json contains an empty name or program; fix it before validation");
+    }
     task.state = "validating".into();
     save(&task)?;
     for (n, check) in config.checks.iter().enumerate() {
-        if check.name.trim().is_empty() || check.program.trim().is_empty() { bail!("empty check field"); }
         let mut c = command(&check.program, &task.worktree);
         c.args(&check.args);
         if let Err(e) = run_logged(c, &dir, &format!("check-{n}"), None) {
@@ -305,5 +372,26 @@ mod tests {
         let root = Path::new("C:/repo");
         assert!(task_dir(root, "../secret").is_err());
         assert!(task_dir(root, "t123-456").is_ok());
+    }
+
+    #[test]
+    fn approved_plan_cannot_be_missing_or_mutated() {
+        assert!(verify_plan_hash(None, "abc").is_err());
+        assert!(verify_plan_hash(Some("abc"), "def").is_err());
+        assert!(verify_plan_hash(Some("abc"), "abc").is_ok());
+    }
+
+    #[test]
+    fn executor_must_report_json_success() {
+        assert!(verify_agy_result(r#"{"status":"SUCCESS"}"#).is_ok());
+        assert!(verify_agy_result(r#"{"status":"WAITING"}"#).is_err());
+        assert!(verify_agy_result("some text but no JSON").is_err());
+    }
+
+    #[test]
+    fn denied_permissions_in_stderr_need_attention() {
+        assert!(has_permission_issue("Tool was soft-denied by permissions"));
+        assert!(has_permission_issue("Authentication Required"));
+        assert!(!has_permission_issue("Finished successfully"));
     }
 }
