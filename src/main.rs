@@ -21,7 +21,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Action {
     Doctor,
-    Start { #[arg(long)] request: String },
+    Start { #[arg(long)] request: String, #[arg(long)] plan_file: Option<PathBuf> },
     Approve { #[arg(long)] task: String },
     Run { #[arg(long)] task: String },
     Validate { #[arg(long)] task: String },
@@ -53,7 +53,7 @@ fn main() -> Result<()> {
     let root = git_root(&cli.repo)?;
     match cli.action {
         Action::Doctor => doctor(&root),
-        Action::Start { request } => start(&root, request),
+        Action::Start { request, plan_file } => start(&root, request, plan_file.as_deref()),
         Action::Approve { task } => approve(&root, &task),
         Action::Run { task } => run(&root, &task),
         Action::Validate { task } => validate(&root, &task),
@@ -205,8 +205,32 @@ fn doctor(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn start(root: &Path, request: String) -> Result<()> {
+const MAX_EXTERNAL_PLAN_BYTES: u64 = 1024 * 1024;
+
+fn valid_external_plan(plan: &str) -> Result<()> {
+    if plan.trim().chars().count() < 100 {
+        bail!("external plan must contain at least 100 non-whitespace characters");
+    }
+    Ok(())
+}
+
+fn read_external_plan(path: &Path) -> Result<String> {
+    let meta = fs::metadata(path)
+        .with_context(|| format!("could not read external plan metadata: {}", path.display()))?;
+    if !meta.is_file() || meta.len() > MAX_EXTERNAL_PLAN_BYTES {
+        bail!("external plan must be a regular text file no larger than 1 MiB");
+    }
+    let plan = fs::read_to_string(path)
+        .with_context(|| format!("could not read external plan: {}", path.display()))?;
+    valid_external_plan(&plan)?;
+    Ok(plan)
+}
+
+fn start(root: &Path, request: String, plan_file: Option<&Path>) -> Result<()> {
     if request.trim().is_empty() { bail!("request is empty"); }
+    // Preflight the imported plan before allocating any task resources or Git refs.
+    // Codex Desktop already planned this task, so avoid invoking Codex CLI again.
+    let external_plan = plan_file.map(read_external_plan).transpose()?;
     if !git(root, &["status", "--porcelain"])?.is_empty() {
         bail!("repository is dirty; commit/stash your changes before starting");
     }
@@ -224,6 +248,19 @@ fn start(root: &Path, request: String) -> Result<()> {
     let mut task = Task { id, request, root: root.to_owned(), worktree: wt, branch, base, approved_plan_hash: None, state: "planning".into() };
     save(&task)?;
     fs::write(dir.join("checks.json"), "{\n  \"checks\": []\n}\n")?;
+    if let Some(plan) = external_plan {
+        fs::write(dir.join("plan.md"), plan)?;
+        task.state = "planned".into();
+        save(&task)?;
+        println!(
+            "Task: {}\nImported plan: {}\nWorktree: {}\nNext: approve --task {}",
+            task.id,
+            dir.join("plan.md").display(),
+            task.worktree.display(),
+            task.id
+        );
+        return Ok(());
+    }
     let prompt = format!(
         "Act only as a software architect. Read this repository; do not modify files. \
         Return a detailed Markdown plan with affected files, ordered tasks, tests, rollback and risks. \
@@ -393,5 +430,18 @@ mod tests {
         assert!(has_permission_issue("Tool was soft-denied by permissions"));
         assert!(has_permission_issue("Authentication Required"));
         assert!(!has_permission_issue("Finished successfully"));
+    }
+
+    #[test]
+    fn external_plan_preflight_rejects_short_or_blank_plans() {
+        assert!(valid_external_plan("").is_err());
+        assert!(valid_external_plan(&" ".repeat(200)).is_err());
+        assert!(valid_external_plan("short").is_err());
+        assert!(valid_external_plan(&"Implemented tasks and tests. ".repeat(5)).is_ok());
+    }
+
+    #[test]
+    fn external_plan_preflight_rejects_missing_file() {
+        assert!(read_external_plan(Path::new("a-file-that-must-not-exist-agentflow-plan.md")).is_err());
     }
 }
