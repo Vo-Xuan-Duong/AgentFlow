@@ -1,12 +1,15 @@
+mod process;
+
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
+    fs::OpenOptions,
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Parser)]
@@ -27,6 +30,8 @@ enum Action {
     Validate { #[arg(long)] task: String },
     Review { #[arg(long)] task: String },
     Status { #[arg(long)] task: String },
+    Cancel { #[arg(long)] task: String },
+    Recover { #[arg(long)] task: String },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -40,6 +45,8 @@ struct Task {
     #[serde(default)]
     approved_plan_hash: Option<String>,
     state: String,
+    #[serde(default)]
+    last_error: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -59,6 +66,8 @@ fn main() -> Result<()> {
         Action::Validate { task } => validate(&root, &task),
         Action::Review { task } => review(&root, &task),
         Action::Status { task } => status(&root, &task),
+        Action::Cancel { task } => cancel(&root, &task),
+        Action::Recover { task } => recover(&root, &task),
     }
 }
 
@@ -154,7 +163,11 @@ fn has_permission_issue(stderr: &str) -> bool {
 }
 
 fn load(root: &Path, id: &str) -> Result<Task> {
-    let task: Task = serde_json::from_slice(&fs::read(task_dir(root, id)?.join("task.json"))?)?;
+    let dir = task_dir(root, id)?;
+    let primary = dir.join("task.json");
+    let backup = dir.join("task.json.bak");
+    let source = if primary.exists() { primary } else { backup };
+    let task: Task = serde_json::from_slice(&fs::read(source)?)?;
     if task.root != root || task.id != id { bail!("task repository mismatch"); }
     Ok(task)
 }
@@ -162,7 +175,26 @@ fn load(root: &Path, id: &str) -> Result<Task> {
 fn save(task: &Task) -> Result<()> {
     let dir = task_dir(&task.root, &task.id)?;
     fs::create_dir_all(&dir)?;
-    fs::write(dir.join("task.json"), serde_json::to_vec_pretty(task)?)?;
+    let final_path = dir.join("task.json");
+    let temp_path = dir.join("task.json.tmp");
+    let data = serde_json::to_vec_pretty(task)?;
+    let mut file = fs::File::create(&temp_path)?;
+    file.write_all(&data)?;
+    file.sync_all()?;
+    // Windows rename does not replace an existing destination. Avoid truncating
+    // task.json in-place; keep a backup that can be recovered if a swap fails.
+    if final_path.exists() {
+        let backup_path = dir.join("task.json.bak");
+        if backup_path.exists() { fs::remove_file(&backup_path)?; }
+        fs::rename(&final_path, &backup_path)?;
+        if let Err(error) = fs::rename(&temp_path, &final_path) {
+            let _ = fs::rename(&backup_path, &final_path);
+            return Err(error.into());
+        }
+        fs::remove_file(backup_path)?;
+    } else {
+        fs::rename(temp_path, final_path)?;
+    }
     Ok(())
 }
 
@@ -175,19 +207,48 @@ fn require(task: &Task, expected: &str) -> Result<()> {
     Ok(())
 }
 
-// Save stdout and stderr separately. On failure, leave all artifacts for debugging.
-fn run_logged(mut c: Command, dir: &Path, name: &str, input: Option<&str>) -> Result<()> {
-    let stdout = fs::File::create(dir.join(format!("{name}.stdout.log")))?;
-    let stderr = fs::File::create(dir.join(format!("{name}.stderr.log")))?;
-    c.stdout(Stdio::from(stdout)).stderr(Stdio::from(stderr));
-    c.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() });
-    let mut child = c.spawn().with_context(|| format!("cannot start {name}"))?;
-    if let Some(input) = input {
-        child.stdin.take().context("missing stdin pipe")?.write_all(input.as_bytes())?;
+const DEFAULT_TIMEOUT_SECONDS: u64 = 1800;
+const MAX_TIMEOUT_SECONDS: u64 = 24 * 3600;
+
+fn timeout_seconds() -> Result<u64> {
+    let seconds = match std::env::var("AGENTFLOW_TIMEOUT_SECONDS") {
+        Ok(value) => value.parse::<u64>().context("AGENTFLOW_TIMEOUT_SECONDS must be an integer")?,
+        Err(std::env::VarError::NotPresent) => DEFAULT_TIMEOUT_SECONDS,
+        Err(error) => return Err(error.into()),
+    };
+    if !(1..=MAX_TIMEOUT_SECONDS).contains(&seconds) {
+        bail!("AGENTFLOW_TIMEOUT_SECONDS must be between 1 and {MAX_TIMEOUT_SECONDS}");
     }
-    let exit = child.wait()?;
-    if !exit.success() { bail!("{name} failed: {exit}; inspect logs in {}", dir.display()); }
-    Ok(())
+    Ok(seconds)
+}
+
+fn run_logged(c: Command, dir: &Path, name: &str, input: Option<&str>) -> Result<()> {
+    process::run_logged(c, dir, name, input, Duration::from_secs(timeout_seconds()?), Some(&dir.join("cancel.request")))
+}
+
+struct TaskLock {
+    file: fs::File,
+}
+
+impl TaskLock {
+    fn acquire(root: &Path, id: &str) -> Result<Self> {
+        let file = OpenOptions::new().read(true).write(true).create(true).truncate(false)
+            .open(task_dir(root, id)?.join("task.lock"))?;
+        file.try_lock().context("another AgentFlow command is already operating on this task")?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for TaskLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn set_failure(task: &mut Task, state: &str, error: &anyhow::Error) -> Result<()> {
+    task.state = state.into();
+    task.last_error = Some(format!("{error:#}"));
+    save(task)
 }
 
 fn doctor(root: &Path) -> Result<()> {
@@ -221,7 +282,7 @@ fn start(root: &Path, request: String) -> Result<()> {
     let mut c = command("git", root);
     c.args(["worktree", "add", "-b", &branch]).arg(&wt).arg(&base);
     run_logged(c, &dir, "worktree", None)?;
-    let mut task = Task { id, request, root: root.to_owned(), worktree: wt, branch, base, approved_plan_hash: None, state: "planning".into() };
+    let mut task = Task { id, request, root: root.to_owned(), worktree: wt, branch, base, approved_plan_hash: None, state: "planning".into(), last_error: None };
     save(&task)?;
     fs::write(dir.join("checks.json"), "{\n  \"checks\": []\n}\n")?;
     let prompt = format!(
@@ -233,15 +294,14 @@ fn start(root: &Path, request: String) -> Result<()> {
     let mut c = command("codex", &task.worktree);
     c.args(["exec", "--sandbox", "read-only", "-o"]).arg(dir.join("plan.md")).arg("-");
     if let Err(e) = run_logged(c, &dir, "planner", Some(&prompt)) {
-        task.state = "needs_attention".into();
-        save(&task)?;
+        set_failure(&mut task, "needs_attention", &e)?;
         return Err(e);
     }
-    let plan = fs::read_to_string(dir.join("plan.md"))?;
-    if plan.len() < 100 {
-        task.state = "needs_attention".into();
-        save(&task)?;
-        bail!("planner output too short; inspect logs");
+    let plan = fs::read_to_string(dir.join("plan.md"));
+    if !matches!(plan, Ok(ref text) if text.len() >= 100) {
+        let error = anyhow::anyhow!("planner output missing, unreadable, or too short; inspect logs");
+        set_failure(&mut task, "needs_attention", &error)?;
+        return Err(error);
     }
     task.state = "planned".into();
     save(&task)?;
@@ -250,6 +310,7 @@ fn start(root: &Path, request: String) -> Result<()> {
 }
 
 fn approve(root: &Path, id: &str) -> Result<()> {
+    let _lock = TaskLock::acquire(root, id)?;
     let mut task = load(root, id)?;
     require(&task, "planned")?;
     let plan_path = task_dir(root, id)?.join("plan.md");
@@ -262,6 +323,7 @@ fn approve(root: &Path, id: &str) -> Result<()> {
 }
 
 fn run(root: &Path, id: &str) -> Result<()> {
+    let _lock = TaskLock::acquire(root, id)?;
     let mut task = load(root, id)?;
     require(&task, "approved")?;
     let dir = task_dir(root, id)?;
@@ -278,8 +340,7 @@ fn run(root: &Path, id: &str) -> Result<()> {
     let mut c = command("agy", &task.worktree);
     c.args(["-p", &prompt, "--output-format", "json", "--print-timeout", "30m"]);
     if let Err(e) = run_logged(c, &dir, "executor", None) {
-        task.state = "needs_attention".into();
-        save(&task)?;
+        set_failure(&mut task, "needs_attention", &e)?;
         return Err(e);
     }
     // A headless invocation may exit 0 even when an action was soft-denied.
@@ -299,8 +360,7 @@ fn run(root: &Path, id: &str) -> Result<()> {
         Ok(())
     })();
     if let Err(e) = inspected {
-        task.state = "needs_attention".into();
-        save(&task)?;
+        set_failure(&mut task, "needs_attention", &e)?;
         return Err(e);
     }
     task.state = "executed".into();
@@ -310,6 +370,7 @@ fn run(root: &Path, id: &str) -> Result<()> {
 }
 
 fn validate(root: &Path, id: &str) -> Result<()> {
+    let _lock = TaskLock::acquire(root, id)?;
     let mut task = load(root, id)?;
     require(&task, "executed")?;
     let dir = task_dir(root, id)?;
@@ -324,8 +385,7 @@ fn validate(root: &Path, id: &str) -> Result<()> {
         let mut c = command(&check.program, &task.worktree);
         c.args(&check.args);
         if let Err(e) = run_logged(c, &dir, &format!("check-{n}"), None) {
-            task.state = "validation_failed".into();
-            save(&task)?;
+            set_failure(&mut task, "validation_failed", &e)?;
             return Err(e);
         }
         println!("PASS {}", check.name);
@@ -336,6 +396,7 @@ fn validate(root: &Path, id: &str) -> Result<()> {
 }
 
 fn review(root: &Path, id: &str) -> Result<()> {
+    let _lock = TaskLock::acquire(root, id)?;
     let mut task = load(root, id)?;
     require(&task, "validated")?;
     let dir = task_dir(root, id)?;
@@ -344,8 +405,7 @@ fn review(root: &Path, id: &str) -> Result<()> {
     let mut c = command("codex", &task.worktree);
     c.args(["review", "--uncommitted"]);
     if let Err(e) = run_logged(c, &dir, "review", None) {
-        task.state = "needs_attention".into();
-        save(&task)?;
+        set_failure(&mut task, "needs_attention", &e)?;
         return Err(e);
     }
     let output = fs::read_to_string(dir.join("review.stdout.log"))?;
@@ -361,6 +421,42 @@ fn status(root: &Path, id: &str) -> Result<()> {
     let task = load(root, id)?;
     println!("Task: {}\nState: {}\nBranch: {}\nWorktree: {}\nArtifacts: {}",
         task.id, task.state, task.branch, task.worktree.display(), task_dir(root, id)?.display());
+    if let Some(error) = task.last_error.as_deref() {
+        println!("Last error: {error}");
+    }
+    if task_dir(root, id)?.join("cancel.request").exists() {
+        println!("Cancellation requested");
+    }
+    Ok(())
+}
+
+
+fn cancel(root: &Path, id: &str) -> Result<()> {
+    let task = load(root, id)?;
+    if !matches!(task.state.as_str(), "planning" | "executing" | "validating" | "reviewing") {
+        bail!("task is not running; state is {}", task.state);
+    }
+    let marker = task_dir(root, id)?.join("cancel.request");
+    OpenOptions::new().write(true).create_new(true).open(&marker)
+        .or_else(|error| if error.kind() == std::io::ErrorKind::AlreadyExists { Ok(fs::File::open(&marker)?) } else { Err(error) })?;
+    println!("Cancellation requested for {id}. The running phase will stop on its next poll.");
+    Ok(())
+}
+
+fn recover(root: &Path, id: &str) -> Result<()> {
+    let _lock = TaskLock::acquire(root, id)?;
+    let mut task = load(root, id)?;
+    if !matches!(task.state.as_str(), "planning" | "executing" | "validating" | "reviewing") {
+        bail!("task is not in an interrupted phase: {}", task.state);
+    }
+    // The task lock proves no cooperating AgentFlow invocation is still active.
+    // On Windows the process supervisor's Job Object closes if AgentFlow dies.
+    task.state = "needs_attention".into();
+    task.last_error = Some("Interrupted phase recovered; manually inspect worktree and logs. No automatic retry or destructive cleanup was performed.".into());
+    save(&task)?;
+    let marker = task_dir(root, id)?.join("cancel.request");
+    if marker.exists() { fs::remove_file(marker)?; }
+    println!("Recovered {id} into needs_attention. Review worktree and logs before starting another task.");
     Ok(())
 }
 
