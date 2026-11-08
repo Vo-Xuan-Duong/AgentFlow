@@ -102,8 +102,8 @@ After a crash or power failure, first ensure the original process has exited:
 `status --task <id>` also detects a stale running state after a CMD window
 was closed and marks the task `needs_attention` (when the lock is free).
 `recover` remains available for explicit recovery. Neither command retries
-
 agent commands, resets Git or deletes code. Inspect worktree and logs.
+JSON state writes use a temporary file and a backup for safer replacement.
 `status` reports the last captured phase error. The lock coordinates
 AgentFlow invocations, not external tools. Windows nested Job Objects and
 launcher behavior require real-machine testing. This is not a security sandbox.
