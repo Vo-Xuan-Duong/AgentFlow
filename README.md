@@ -207,6 +207,10 @@ set "REPO=C:\Dev\AgentFlowSandbox"
 "%AF%" --repo "%REPO%" ui
 ```
 
+The `ui` subcommand is optional: running `"%AF%" --repo "%REPO%"`
+with no subcommand opens the same full-screen application, similar to
+launching Codex from the command line.
+
 The UI starts in a Windows CMD or Windows Terminal window attached to the
 repository given by `--repo`. Enter a request at the bottom of the screen
 and press Enter. The Codex planner runs in a worker thread while the screen
