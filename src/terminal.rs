@@ -8,10 +8,6 @@ pub fn stop_requested() -> bool {
     STOP_REQUESTED.load(Ordering::SeqCst)
 }
 
-/// Used by interactive UI when a user exits while a task is still active.
-pub fn request_stop() {
-    STOP_REQUESTED.store(true, Ordering::SeqCst);
-}
 
 #[cfg(windows)]
 mod windows {
