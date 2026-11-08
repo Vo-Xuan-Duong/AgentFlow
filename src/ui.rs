@@ -2,8 +2,8 @@
 //! Agent commands run on a worker thread, but no detached service is started.
 //! Closing the terminal ends this process and the Windows Job Object closes.
 use crate::{
-    approve, load, process, review, run as execute, start, state_root, task_dir, terminal,
-    validate, Task,
+    approve, inspect_active_task, process, review, run as execute, start, state_root,
+    task_dir, terminal, validate, Task,
 };
 use anyhow::{Context, Result};
 use crossterm::{
@@ -160,7 +160,7 @@ impl App {
                     continue;
                 }
                 let id = entry.file_name().to_string_lossy().to_string();
-                if let Ok(task) = load(&self.root, &id) {
+                if let Ok((task, _)) = inspect_active_task(&self.root, &id) {
                     tasks.push(task);
                 }
             }
