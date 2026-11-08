@@ -185,6 +185,8 @@ fn save(task: &Task) -> Result<()> {
     let mut file = fs::File::create(&temp_path)?;
     file.write_all(&data)?;
     file.sync_all()?;
+    drop(file);
+    // Close the temporary handle before rename for reliable Windows operation.
     // Windows rename does not replace an existing destination. Avoid truncating
     // task.json in-place; keep a backup that can be recovered if a swap fails.
     if final_path.exists() {
