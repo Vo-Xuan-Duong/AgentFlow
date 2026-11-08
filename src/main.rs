@@ -602,4 +602,38 @@ mod tests {
             assert!(!is_running_phase(state));
         }
     }
+
+    #[test]
+    fn status_recovers_interrupted_foreground_run_without_executing_commands() {
+        let marker = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let sandbox = std::env::temp_dir().join(format!(
+            "agentflow-status-test-{}-{marker}", std::process::id()
+        ));
+        let repo = sandbox.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let root = fs::canonicalize(&repo).unwrap();
+        let id = "t-foreground-test";
+        let task = Task {
+            id: id.into(),
+            request: "testing stale-state recovery".into(),
+            root: root.clone(),
+            worktree: root.clone(),
+            branch: "agentflow/test".into(),
+            base: "unused".into(),
+            approved_plan_hash: None,
+            state: "executing".into(),
+            last_error: None,
+        };
+        save(&task).unwrap();
+
+        let (recovered, active) = inspect_active_task(&root, id).unwrap();
+        assert!(!active);
+        assert_eq!(recovered.state, "needs_attention");
+        assert!(recovered.last_error.as_deref().unwrap().contains("Foreground command exited"));
+
+        let (second, active_again) = inspect_active_task(&root, id).unwrap();
+        assert!(!active_again);
+        assert_eq!(second.state, "needs_attention");
+        fs::remove_dir_all(sandbox).unwrap();
+    }
 }
