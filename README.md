@@ -1,6 +1,6 @@
 # AgentFlow — Rust Orchestrator (MVP)
 
-Lightweight, local-first Windows CLI to coordinate **Codex CLI (planner/reviewer)** and **Antigravity CLI (executor)** in an isolated Git worktree. **No database server, Docker, web UI, automatic commits or merges.**
+Lightweight, local-first Windows orchestrator: **Codex Desktop plans and delegates**, **Antigravity CLI edits code**, and the Ratatui terminal is a **read-only status monitor**. **No database server, Docker, web UI, automatic commits or merges.**
 
 > This is an experimental MVP. CI compilation on Windows and actual authenticated Codex/Antigravity runs must pass before production use. Agent prompts and Git worktrees are **not** OS security sandboxes.
 
@@ -88,9 +88,9 @@ From a second terminal, request cooperative cancellation:
 & $af cancel --task $task
 ```
 
-The executing process polls and stops its subprocess tree. The task moves to
-`needs_attention` (or `validation_failed` for validation). State, logs and
-the worktree are retained for manual review.
+The running CMD window now shows a foreground RUNNING heartbeat with child PID,
+bounded stderr preview and DONE/FAILED/CANCELLED status. The executing process
+polls and stops its subprocess tree on Ctrl+C or cancel. State, full logs and the worktree remain for review. There is no detached service or background process.
 
 After a crash or power failure, first ensure the original process has exited:
 
@@ -99,10 +99,10 @@ After a crash or power failure, first ensure the original process has exited:
 & $af status --task $task
 ```
 
-Recovery acquires the per-task file lock and moves interrupted phases to
-`needs_attention`. It never retries an agent command, resets Git, or deletes
-files. Inspect the worktree and logs before starting a new task.
-
+`status --task <id>` also detects a stale running state after a CMD window
+was closed and marks the task `needs_attention` (when the lock is free).
+`recover` remains available for explicit recovery. Neither command retries
+agent commands, resets Git or deletes code. Inspect worktree and logs.
 JSON state writes use a temporary file and a backup for safer replacement.
 `status` reports the last captured phase error. The lock coordinates
 AgentFlow invocations, not external tools. Windows nested Job Objects and
@@ -111,9 +111,10 @@ launcher behavior require real-machine testing. This is not a security sandbox.
 ## Codex Desktop as controller, Antigravity as code executor
 
 Codex Desktop can be the user-facing chat and planner while AgentFlow calls
-Antigravity to edit the code. The repository includes a project-local skill:
-`.agents/skills/delegate-to-antigravity/SKILL.md`. Open this repository
-in Codex Desktop and explicitly request the `delegate-to-antigravity` skill.
+Antigravity to edit the code. The repository includes the skill at
+`.agents/skills/delegate-to-antigravity/SKILL.md`; copy it to the Codex user
+skill directory as shown below, then open the **target project** in Codex
+Desktop and use `delegate-to-antigravity`.
 Codex Desktop needs terminal permissions to run the installed AgentFlow CLI.
 
 The usual `start --request` flow still uses Codex CLI to produce a plan.
@@ -146,3 +147,112 @@ for code edits. Worktrees are not security sandboxes. Finish with
 **Important:** This integrates through the terminal/skill workflow; it does
 not add a built-in graphical button to Codex Desktop. Actual agent CLI
 flags, authentication and permissions must be validated on your machine.
+
+## Foreground CMD mode (Windows)
+
+AgentFlow runs **only when invoked**; it is not a background service. Each
+`start`, `run`, `validate` and `review` command remains attached to its CMD
+terminal and emits a status line with the running PID and elapsed time every
+two seconds. Full stdout and stderr remain in the task artifact logs.
+
+Run in Command Prompt (`cmd.exe`):
+
+```cmd
+set "AF=C:\Dev\AgentFlow\target\release\agentflow.exe"
+set "REPO=C:\Dev\AgentFlowSandbox"
+set "TASK=REPLACE_WITH_REAL_TASK_ID"
+"%AF%" --repo "%REPO%" run --task "%TASK%"
+```
+
+Example foreground output:
+
+```text
+[AgentFlow] Task t123-456: EXECUTING in foreground (Ctrl+C to stop)
+[AgentFlow] RUNNING  executor | PID 12345 | timeout 00:30:00 | Ctrl+C to stop
+[AgentFlow] RUNNING  executor | 00:00:02 elapsed | PID 12345 | Ctrl+C to stop
+[AgentFlow] DONE     executor | elapsed 00:00:06
+[AgentFlow] Task t123-456: EXECUTED (no background process remains)
+```
+
+To stop, press **Ctrl+C** in the same CMD window. AgentFlow requests
+cancellation and terminates supervised subprocesses; the task state is
+updated to `needs_attention`, keeping the worktree and logs. Closing the
+CMD window ends AgentFlow; on Windows the process Job Object uses
+`KILL_ON_JOB_CLOSE` to terminate descendants even if the console-close
+event does not allow time to persist state. The next `status` call detects
+the stale phase and marks it `needs_attention` without restarting work.
+
+```cmd
+"%AF%" --repo "%REPO%" status --task "%TASK%"
+```
+
+Limitations: this is **not** an interactive Antigravity UI. The terminal
+shows supervisor progress and a bounded stderr preview; agent JSON stdout
+is retained in `executor.stdout.log`. Commands from another IDE terminal
+may outlive that UI depending on how the IDE launches subprocesses.
+Windows Job Object attachment can fail in unusual nested-job environments.
+Test Ctrl+C and window-close behavior with a disposable repository first.
+
+## Status-only terminal monitor for Codex Desktop
+
+**Codex Desktop is the primary workspace and the only place to enter coding
+requests.** It prepares the implementation plan, asks for approval and
+invokes AgentFlow CLI with `start --plan-file`, `approve` and `run`.
+AgentFlow calls `agy` to edit code in a dedicated worktree. Codex Desktop
+never needs to open AgentFlow's terminal interface to delegate work.
+
+The separate full-screen terminal is only a **read-only dashboard**:
+it shows `MONITOR ONLINE`, how many real CLI jobs are active, task phase,
+request and worktree. It has **no prompt editor**, **no approval buttons**,
+and **no executor commands**. A task is displayed as `RUNNING` only when
+its CLI phase holds the task file lock. A phase that still says `executing`
+but has no live lock shows `INTERRUPTED` instead of a false running status.
+The monitor does not modify or recover task state.
+
+### Build and open monitor from Windows CMD
+
+```cmd
+cd /d C:\Dev\AgentFlow
+git switch main
+git pull --ff-only
+cargo build --release
+set "AF=C:\Dev\AgentFlow\target\release\agentflow.exe"
+set "REPO=C:\Dev\AgentFlowSandbox"
+"%AF%" --repo "%REPO%" monitor
+```
+
+The `monitor` command is optional: bare `agentflow` (from a Git repository)
+opens the monitor by default. `agentflow ui` remains a compatible alias.
+Press Up/Down to select a task, `R` to refresh, and `Q`, `Esc` or `Ctrl+C`
+to close the viewer. **Closing this window will not stop Antigravity**
+started independently by Codex Desktop. To stop an executor, use the
+Codex Desktop conversation or the explicit CLI `cancel` operation.
+
+### Install or update the Codex Desktop Skill
+
+The skill is shipped at `.agents/skills/delegate-to-antigravity/SKILL.md`.
+Install it globally for work on unrelated repositories:
+
+```cmd
+mkdir "%USERPROFILE%\.agents\skills\delegate-to-antigravity"
+copy /Y "C:\Dev\AgentFlow\.agents\skills\delegate-to-antigravity\SKILL.md" "%USERPROFILE%\.agents\skills\delegate-to-antigravity\SKILL.md"
+```
+
+Start a new conversation in Codex Desktop, open your **target project**
+(not the AgentFlow source), and request:
+
+> Use `delegate-to-antigravity`. Analyze this project and propose a plan.
+> After I approve it, have AgentFlow send the plan to Antigravity to write
+> code. Do not edit source code in Codex.
+
+Codex Desktop should do the actual work dispatching. The monitor is optional
+and may be open before, during or after the Codex session; it cannot itself
+initiate or modify any task.
+
+### Limitations
+
+The CLI must be reachable from Codex Desktop and `agy` must be installed,
+authenticated and compatible with AgentFlow's headless flags. A clean Git
+repository and explicit plan approval are required. Real Codex Desktop →
+Antigravity integration requires a manual test on Windows; CI only verifies
+build, lint and unit tests. Agent worktrees are not security sandboxes.
