@@ -217,11 +217,11 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
     .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(CYAN)));
     frame.render_widget(header, layout[0]);
 
-    let columns = Layout::default().direction(Direction::Horizontal())
+    let columns = Layout::default().direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(37), Constraint::Percentage(63)])
         .split(layout[1]);
     let tasks: Vec<ListItem<'_>> = app.tasks.iter().map(|snapshot| {
-        let request = snapshot.task.request.replace(['\n', '\r'], " ");
+        let request = snapshot.task.request.replace('\n', " ").replace('\r', " ");
         let label = format!(
             "{}\n  {} · {}",
             truncate_chars(&request, 37),
@@ -407,5 +407,35 @@ mod tests {
     fn truncate_unicode_is_safe() {
         assert_eq!(truncate_chars("Tiếng Việt", 6), "Tiếng…");
         assert_eq!(truncate_chars("ok", 6), "ok");
+    }
+
+    #[test]
+    fn stale_task_check_does_not_create_or_modify_a_lock() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let sandbox = std::env::temp_dir().join(format!(
+            "agentflow-monitor-{}-{stamp}",
+            std::process::id()
+        ));
+        let root = sandbox.join("repo");
+        fs::create_dir_all(&root).unwrap();
+        let task = Task {
+            id: "t123".into(),
+            request: "test".into(),
+            root: root.clone(),
+            worktree: root.clone(),
+            branch: "agentflow/t123".into(),
+            base: "sha".into(),
+            approved_plan_hash: None,
+            state: "executing".into(),
+            last_error: None,
+        };
+        let lock_path = task_dir(&root, &task.id).unwrap().join("task.lock");
+        assert!(!lock_path.exists());
+        assert_eq!(detect_activity(&root, &task), Activity::Interrupted);
+        assert!(!lock_path.exists(), "monitor must never create task locks");
+        fs::remove_dir_all(sandbox).unwrap();
     }
 }
