@@ -221,7 +221,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
         .constraints([Constraint::Percentage(37), Constraint::Percentage(63)])
         .split(layout[1]);
     let tasks: Vec<ListItem<'_>> = app.tasks.iter().map(|snapshot| {
-        let request = snapshot.task.request.replace('\n', " ").replace('\r', " ");
+        let request = snapshot.task.request.replace(['\n', '\r'], " ");
         let label = format!(
             "{}\n  {} · {}",
             truncate_chars(&request, 37),
