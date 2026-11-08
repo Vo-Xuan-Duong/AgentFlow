@@ -338,7 +338,7 @@ fn start(root: &Path, request: String, plan_file: Option<&Path>) -> Result<()> {
         fs::write(dir.join("plan.md"), plan)?;
         task.state = "planned".into();
         save(&task)?;
-        if !process::is_quiet() {
+        
             println!(
                 "Task: {}\nImported plan: {}\nWorktree: {}\nNext: approve --task {}",
                 task.id,
@@ -346,7 +346,7 @@ fn start(root: &Path, request: String, plan_file: Option<&Path>) -> Result<()> {
                 task.worktree.display(),
                 task.id
             );
-        }
+        
         return Ok(());
     }
     let prompt = format!(
@@ -369,9 +369,9 @@ fn start(root: &Path, request: String, plan_file: Option<&Path>) -> Result<()> {
     }
     task.state = "planned".into();
     save(&task)?;
-    if !process::is_quiet() {
+    
         println!("Task: {}\nPlan: {}\nWorktree: {}\nNext: approve --task {}", task.id, dir.join("plan.md").display(), task.worktree.display(), task.id);
-    }
+    
     Ok(())
 }
 
@@ -383,7 +383,7 @@ fn approve(root: &Path, id: &str) -> Result<()> {
     let plan = fs::read_to_string(&plan_path)?;
     if plan.len() < 100 { bail!("plan.md is too short to approve"); }
     task.approved_plan_hash = Some(plan_digest(root, &plan)?);
-    if !process::is_quiet() { println!("Approving plan at {}", plan_path.display()); }
+     println!("Approving plan at {}", plan_path.display()); 
     task.state = "approved".into();
     save(&task)
 }
@@ -397,9 +397,9 @@ fn run(root: &Path, id: &str) -> Result<()> {
     verify_plan_hash(task.approved_plan_hash.as_deref(), &plan_digest(root, &plan)?)?;
     task.state = "executing".into();
     save(&task)?;
-    if !process::is_quiet() {
+    
         eprintln!("[AgentFlow] Task {id}: EXECUTING in foreground (Ctrl+C to stop)");
-    }
+    
     let prompt = format!(
         "Implement the approved plan in the CURRENT worktree only. \
         Do not commit, push, merge, delete files outside the plan, or modify sibling repositories. \
@@ -434,10 +434,10 @@ fn run(root: &Path, id: &str) -> Result<()> {
     }
     task.state = "executed".into();
     save(&task)?;
-    if !process::is_quiet() {
+    
         eprintln!("[AgentFlow] Task {id}: EXECUTED (no background process remains)");
         println!("Implementation in {}. Configure checks.json, then validate.", task.worktree.display());
-    }
+    
     Ok(())
 }
 
@@ -453,9 +453,9 @@ fn validate(root: &Path, id: &str) -> Result<()> {
     }
     task.state = "validating".into();
     save(&task)?;
-    if !process::is_quiet() {
+    
         eprintln!("[AgentFlow] Task {id}: VALIDATING in foreground (Ctrl+C to stop)");
-    }
+    
     for (n, check) in config.checks.iter().enumerate() {
         let mut c = command(&check.program, &task.worktree);
         c.args(&check.args);
@@ -465,7 +465,7 @@ fn validate(root: &Path, id: &str) -> Result<()> {
             set_failure(&mut task, if interrupted { "needs_attention" } else { "validation_failed" }, &e)?;
             return Err(e);
         }
-        if !process::is_quiet() { println!("PASS {}", check.name); }
+         println!("PASS {}", check.name); 
     }
     task.state = "validated".into();
     save(&task)?;
@@ -479,9 +479,9 @@ fn review(root: &Path, id: &str) -> Result<()> {
     let dir = task_dir(root, id)?;
     task.state = "reviewing".into();
     save(&task)?;
-    if !process::is_quiet() {
+    
         eprintln!("[AgentFlow] Task {id}: REVIEWING in foreground (Ctrl+C to stop)");
-    }
+    
     let mut c = command("codex", &task.worktree);
     c.args(["review", "--uncommitted"]);
     if let Err(e) = run_logged(c, &dir, "review", None) {
@@ -493,9 +493,9 @@ fn review(root: &Path, id: &str) -> Result<()> {
     // Human gate: never infer approval from ambiguous natural-language review output.
     task.state = "awaiting_human_review".into();
     save(&task)?;
-    if !process::is_quiet() {
+    
         println!("Review: {}\nInspect diff + review manually. AgentFlow never auto-commits or merges.", dir.join("review.md").display());
-    }
+    
     Ok(())
 }
 
