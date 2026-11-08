@@ -328,10 +328,10 @@ impl App {
             {
                 self.input.clear();
             }
-            KeyCode::Char(c) if self.focus == Focus::Compose => {
-                if self.input.chars().count() < MAX_INPUT {
-                    self.input.push(c);
-                }
+            KeyCode::Char(c)
+                if self.focus == Focus::Compose && self.input.chars().count() < MAX_INPUT =>
+            {
+                self.input.push(c);
             }
             _ => {}
         }
