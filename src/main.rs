@@ -20,7 +20,7 @@ struct Cli {
     #[arg(long, global = true, default_value = ".")]
     repo: PathBuf,
     #[command(subcommand)]
-    action: Action,
+    action: Option<Action>,
 }
 
 #[derive(Subcommand)]
@@ -61,11 +61,13 @@ struct Check { name: String, program: String, #[serde(default)] args: Vec<String
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    if matches!(&cli.action, Action::Start { .. } | Action::Run { .. } | Action::Validate { .. } | Action::Review { .. }) {
+    // Like Codex CLI, bare "agentflow" opens interactive mode.
+    let action = cli.action.unwrap_or(Action::Ui);
+    if matches!(&action, Action::Start { .. } | Action::Run { .. } | Action::Validate { .. } | Action::Review { .. }) {
         terminal::install()?;
     }
     let root = git_root(&cli.repo)?;
-    match cli.action {
+    match action {
         Action::Doctor => doctor(&root),
         Action::Ui => ui::run(&root),
         Action::Start { request, plan_file } => start(&root, request, plan_file.as_deref()),
