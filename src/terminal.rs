@@ -11,7 +11,7 @@ pub fn stop_requested() -> bool {
 #[cfg(windows)]
 mod windows {
     use super::*;
-    use anyhow::{bail, Context};
+    use anyhow::bail;
     use windows_sys::Win32::System::Console::{
         SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT,
     };
