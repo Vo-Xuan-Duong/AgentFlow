@@ -3,6 +3,7 @@
 use crate::terminal;
 use anyhow::{bail, Context, Result};
 use std::{
+    cell::Cell,
     fs,
     io::Read,
     path::{Path, PathBuf},
@@ -10,6 +11,28 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+thread_local! {
+    static QUIET: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Used by the full-screen UI worker so regular CLI output never corrupts
+/// the alternate screen. The child still writes its full logs to disk.
+pub fn with_quiet<T>(run: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            QUIET.with(|quiet| quiet.set(self.0));
+        }
+    }
+    let previous = QUIET.with(|quiet| quiet.replace(true));
+    let _reset = Reset(previous);
+    run()
+}
+
+pub fn is_quiet() -> bool {
+    QUIET.with(Cell::get)
+}
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
@@ -33,7 +56,7 @@ fn show_stderr_updates(
                     let printable: String = raw.chars()
                         .map(|ch| if ch.is_control() { ' ' } else { ch })
                         .collect();
-                    eprintln!("[AgentFlow][{name}] {}", printable.trim());
+                    if !is_quiet() { eprintln!("[AgentFlow][{name}] {}", printable.trim()); }
                     pending.clear();
                 }
             } else if pending.len() < MAX_STDERR_PREVIEW {
@@ -97,8 +120,8 @@ pub fn run_logged(
         let mut last_heartbeat = started;
         let mut stderr_reader = fs::File::open(&stderr_path)?;
         let mut stderr_pending = Vec::new();
-        eprintln!("[AgentFlow] RUNNING  {name} | PID {} | timeout {} | Ctrl+C to stop",
-            child.id(), duration_label(timeout));
+        if !is_quiet() { eprintln!("[AgentFlow] RUNNING  {name} | PID {} | timeout {} | Ctrl+C to stop",
+            child.id(), duration_label(timeout)); }
         loop {
             show_stderr_updates(&mut stderr_reader, &mut stderr_pending, name)?;
             match child.try_wait() {
@@ -109,14 +132,14 @@ pub fn run_logged(
                         let clean: String = printable.chars()
                             .map(|ch| if ch.is_control() { ' ' } else { ch })
                             .collect();
-                        eprintln!("[AgentFlow][{name}] {}", clean.trim());
+                        if !is_quiet() { eprintln!("[AgentFlow][{name}] {}", clean.trim()); }
                     }
                     if !status.success() {
-                        eprintln!("[AgentFlow] FAILED   {name} | exit {status}");
+                        if !is_quiet() { eprintln!("[AgentFlow] FAILED   {name} | exit {status}"); }
                         bail!("{name} failed: {status}; inspect logs in {}", dir.display());
                     }
-                    eprintln!("[AgentFlow] DONE     {name} | elapsed {}",
-                        duration_label(started.elapsed()));
+                    if !is_quiet() { eprintln!("[AgentFlow] DONE     {name} | elapsed {}",
+                        duration_label(started.elapsed())); }
                     return Ok(());
                 }
                 Err(error) => {
@@ -127,19 +150,19 @@ pub fn run_logged(
             }
 
             if terminal::stop_requested() || cancel_marker.is_some_and(Path::exists) {
-                eprintln!("[AgentFlow] STOPPING {name} | terminating child process tree...");
+                if !is_quiet() { eprintln!("[AgentFlow] STOPPING {name} | terminating child process tree..."); }
                 terminate_and_reap(&mut child, &job)?;
-                eprintln!("[AgentFlow] CANCELLED {name} | logs in {}", dir.display());
+                if !is_quiet() { eprintln!("[AgentFlow] CANCELLED {name} | logs in {}", dir.display()); }
                 bail!("{name} cancelled; inspect logs in {}", dir.display());
             }
             if started.elapsed() >= timeout {
-                eprintln!("[AgentFlow] TIMEOUT  {name} | terminating child process tree...");
+                if !is_quiet() { eprintln!("[AgentFlow] TIMEOUT  {name} | terminating child process tree..."); }
                 terminate_and_reap(&mut child, &job)?;
                 bail!("{name} timed out after {} seconds; inspect logs in {}", timeout.as_secs(), dir.display());
             }
             if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
-                eprintln!("[AgentFlow] RUNNING  {name} | {} elapsed | PID {} | Ctrl+C to stop",
-                    duration_label(started.elapsed()), child.id());
+                if !is_quiet() { eprintln!("[AgentFlow] RUNNING  {name} | {} elapsed | PID {} | Ctrl+C to stop",
+                    duration_label(started.elapsed()), child.id()); }
                 last_heartbeat = Instant::now();
             }
             thread::sleep(POLL_INTERVAL);

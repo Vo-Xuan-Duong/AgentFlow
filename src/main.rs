@@ -1,5 +1,6 @@
 mod process;
 mod terminal;
+mod ui;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -19,12 +20,14 @@ struct Cli {
     #[arg(long, global = true, default_value = ".")]
     repo: PathBuf,
     #[command(subcommand)]
-    action: Action,
+    action: Option<Action>,
 }
 
 #[derive(Subcommand)]
 enum Action {
     Doctor,
+    /// Open full-screen interactive terminal for composing tasks and controlling agents.
+    Ui,
     Start { #[arg(long)] request: String, #[arg(long)] plan_file: Option<PathBuf> },
     Approve { #[arg(long)] task: String },
     Run { #[arg(long)] task: String },
@@ -58,12 +61,15 @@ struct Check { name: String, program: String, #[serde(default)] args: Vec<String
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    if matches!(&cli.action, Action::Start { .. } | Action::Run { .. } | Action::Validate { .. } | Action::Review { .. }) {
+    // Like Codex CLI, bare "agentflow" opens interactive mode.
+    let action = cli.action.unwrap_or(Action::Ui);
+    if matches!(&action, Action::Start { .. } | Action::Run { .. } | Action::Validate { .. } | Action::Review { .. }) {
         terminal::install()?;
     }
     let root = git_root(&cli.repo)?;
-    match cli.action {
+    match action {
         Action::Doctor => doctor(&root),
+        Action::Ui => ui::run(&root),
         Action::Start { request, plan_file } => start(&root, request, plan_file.as_deref()),
         Action::Approve { task } => approve(&root, &task),
         Action::Run { task } => run(&root, &task),
@@ -331,13 +337,15 @@ fn start(root: &Path, request: String, plan_file: Option<&Path>) -> Result<()> {
         fs::write(dir.join("plan.md"), plan)?;
         task.state = "planned".into();
         save(&task)?;
-        println!(
-            "Task: {}\nImported plan: {}\nWorktree: {}\nNext: approve --task {}",
-            task.id,
-            dir.join("plan.md").display(),
-            task.worktree.display(),
-            task.id
-        );
+        if !process::is_quiet() {
+            println!(
+                "Task: {}\nImported plan: {}\nWorktree: {}\nNext: approve --task {}",
+                task.id,
+                dir.join("plan.md").display(),
+                task.worktree.display(),
+                task.id
+            );
+        }
         return Ok(());
     }
     let prompt = format!(
@@ -360,7 +368,9 @@ fn start(root: &Path, request: String, plan_file: Option<&Path>) -> Result<()> {
     }
     task.state = "planned".into();
     save(&task)?;
-    println!("Task: {}\nPlan: {}\nWorktree: {}\nNext: approve --task {}", task.id, dir.join("plan.md").display(), task.worktree.display(), task.id);
+    if !process::is_quiet() {
+        println!("Task: {}\nPlan: {}\nWorktree: {}\nNext: approve --task {}", task.id, dir.join("plan.md").display(), task.worktree.display(), task.id);
+    }
     Ok(())
 }
 
@@ -372,7 +382,7 @@ fn approve(root: &Path, id: &str) -> Result<()> {
     let plan = fs::read_to_string(&plan_path)?;
     if plan.len() < 100 { bail!("plan.md is too short to approve"); }
     task.approved_plan_hash = Some(plan_digest(root, &plan)?);
-    println!("Approving plan at {}", plan_path.display());
+    if !process::is_quiet() { println!("Approving plan at {}", plan_path.display()); }
     task.state = "approved".into();
     save(&task)
 }
@@ -386,7 +396,9 @@ fn run(root: &Path, id: &str) -> Result<()> {
     verify_plan_hash(task.approved_plan_hash.as_deref(), &plan_digest(root, &plan)?)?;
     task.state = "executing".into();
     save(&task)?;
-    eprintln!("[AgentFlow] Task {id}: EXECUTING in foreground (Ctrl+C to stop)");
+    if !process::is_quiet() {
+        eprintln!("[AgentFlow] Task {id}: EXECUTING in foreground (Ctrl+C to stop)");
+    }
     let prompt = format!(
         "Implement the approved plan in the CURRENT worktree only. \
         Do not commit, push, merge, delete files outside the plan, or modify sibling repositories. \
@@ -421,8 +433,10 @@ fn run(root: &Path, id: &str) -> Result<()> {
     }
     task.state = "executed".into();
     save(&task)?;
-    eprintln!("[AgentFlow] Task {id}: EXECUTED (no background process remains)");
-    println!("Implementation in {}. Configure checks.json, then validate.", task.worktree.display());
+    if !process::is_quiet() {
+        eprintln!("[AgentFlow] Task {id}: EXECUTED (no background process remains)");
+        println!("Implementation in {}. Configure checks.json, then validate.", task.worktree.display());
+    }
     Ok(())
 }
 
@@ -438,7 +452,9 @@ fn validate(root: &Path, id: &str) -> Result<()> {
     }
     task.state = "validating".into();
     save(&task)?;
-    eprintln!("[AgentFlow] Task {id}: VALIDATING in foreground (Ctrl+C to stop)");
+    if !process::is_quiet() {
+        eprintln!("[AgentFlow] Task {id}: VALIDATING in foreground (Ctrl+C to stop)");
+    }
     for (n, check) in config.checks.iter().enumerate() {
         let mut c = command(&check.program, &task.worktree);
         c.args(&check.args);
@@ -448,7 +464,7 @@ fn validate(root: &Path, id: &str) -> Result<()> {
             set_failure(&mut task, if interrupted { "needs_attention" } else { "validation_failed" }, &e)?;
             return Err(e);
         }
-        println!("PASS {}", check.name);
+        if !process::is_quiet() { println!("PASS {}", check.name); }
     }
     task.state = "validated".into();
     save(&task)?;
@@ -462,7 +478,9 @@ fn review(root: &Path, id: &str) -> Result<()> {
     let dir = task_dir(root, id)?;
     task.state = "reviewing".into();
     save(&task)?;
-    eprintln!("[AgentFlow] Task {id}: REVIEWING in foreground (Ctrl+C to stop)");
+    if !process::is_quiet() {
+        eprintln!("[AgentFlow] Task {id}: REVIEWING in foreground (Ctrl+C to stop)");
+    }
     let mut c = command("codex", &task.worktree);
     c.args(["review", "--uncommitted"]);
     if let Err(e) = run_logged(c, &dir, "review", None) {
@@ -474,7 +492,9 @@ fn review(root: &Path, id: &str) -> Result<()> {
     // Human gate: never infer approval from ambiguous natural-language review output.
     task.state = "awaiting_human_review".into();
     save(&task)?;
-    println!("Review: {}\nInspect diff + review manually. AgentFlow never auto-commits or merges.", dir.join("review.md").display());
+    if !process::is_quiet() {
+        println!("Review: {}\nInspect diff + review manually. AgentFlow never auto-commits or merges.", dir.join("review.md").display());
+    }
     Ok(())
 }
 

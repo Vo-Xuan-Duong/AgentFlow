@@ -1,6 +1,6 @@
 # AgentFlow — Rust Orchestrator (MVP)
 
-Lightweight, local-first Windows CLI to coordinate **Codex CLI (planner/reviewer)** and **Antigravity CLI (executor)** in an isolated Git worktree. **No database server, Docker, web UI, automatic commits or merges.**
+Lightweight, local-first Windows CLI and interactive Ratatui terminal to coordinate **Codex CLI (planner/reviewer)** and **Antigravity CLI (executor)** in an isolated Git worktree. **No database server, Docker, web UI, automatic commits or merges.**
 
 > This is an experimental MVP. CI compilation on Windows and actual authenticated Codex/Antigravity runs must pass before production use. Agent prompts and Git worktrees are **not** OS security sandboxes.
 
@@ -191,3 +191,60 @@ is retained in `executor.stdout.log`. Commands from another IDE terminal
 may outlive that UI depending on how the IDE launches subprocesses.
 Windows Job Object attachment can fail in unusual nested-job environments.
 Test Ctrl+C and window-close behavior with a disposable repository first.
+
+## Interactive terminal UI (Codex-like)
+
+AgentFlow now has a full-screen Ratatui interface. It is a **real interactive
+terminal application**, not a status log tail. It does not run as a daemon.
+Codex CLI creates the plan; Antigravity CLI writes code after approval.
+
+```cmd
+cd /d C:\Dev\AgentFlow
+git pull --ff-only
+cargo build --release
+set "AF=C:\Dev\AgentFlow\target\release\agentflow.exe"
+set "REPO=C:\Dev\AgentFlowSandbox"
+"%AF%" --repo "%REPO%" ui
+```
+
+The `ui` subcommand is optional: running `"%AF%" --repo "%REPO%"`
+with no subcommand opens the same full-screen application, similar to
+launching Codex from the command line.
+
+The UI starts in a Windows CMD or Windows Terminal window attached to the
+repository given by `--repo`. Enter a request at the bottom of the screen
+and press Enter. The Codex planner runs in a worker thread while the screen
+shows task status. Review the generated plan before approval.
+
+| Key | Action |
+| --- | --- |
+| Enter | Submit prompt to Codex planner (when composing) |
+| Tab | Switch between task list and prompt |
+| Up / Down | Select prior task (task list focused) |
+| F7 | Open full plan; PageUp / PageDown scroll |
+| F2 twice | Review then explicitly approve selected planned task |
+| F3 | Execute an approved task using Antigravity CLI |
+| F4 | Validate an executed task using configured checks.json |
+| F5 | Run Codex review of a validated task |
+| F6 | Request cancellation of active task |
+| Esc or Ctrl+C | Stop active task and exit; otherwise exit immediately |
+
+The UI watches task state files, so tasks created via Codex Desktop Skill
+and `start --plan-file` also appear in the task list. When using the UI
+input box directly, it invokes **Codex CLI** as planner; this is separate
+from the Codex Desktop chat interface. No automatic code changes by Codex
+are performed by this UI; Antigravity remains executor.
+
+Validation deliberately does **not** pass without explicit non-destructive
+checks defined in the task's `checks.json`. Refer to
+`examples/checks-rust.json` and the artifact location in each task.
+
+The full-screen interface hides regular CLI status/log text; detailed agent
+stdout/stderr remains in task artifacts. Exiting closes the foreground
+AgentFlow process. A running Windows Job Object is terminated on process
+close. In-process Ctrl+C asks the supervisor to stop first. Worktrees and
+artifacts persist for manual inspection; no auto-retry, auto-commit or merge.
+
+**Prerequisites:** a working Git, Codex CLI and installed authenticated
+Antigravity CLI `agy`. The UI does not bypass permissions or make worktrees
+security sandboxes. Test with a disposable repository first.
