@@ -1,8 +1,10 @@
 //! Bounded, logged subprocess execution. A Windows Job Object prevents agent process
 //! trees from being left behind when the supervisor exits or terminates a command.
+use crate::terminal;
 use anyhow::{bail, Context, Result};
 use std::{
     fs,
+    io::Read,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
@@ -10,6 +12,44 @@ use std::{
 };
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+const MAX_STDERR_PREVIEW: usize = 320;
+
+/// Only show bounded, printable stderr lines in the terminal. Full logs are
+/// retained on disk. Antigravity's JSON stdout remains intact for validation.
+fn show_stderr_updates(
+    source: &mut fs::File,
+    pending: &mut Vec<u8>,
+    name: &str,
+) -> Result<()> {
+    let mut buffer = [0_u8; 2048];
+    for _ in 0..8 {
+        let count = source.read(&mut buffer)?;
+        if count == 0 { break; }
+        for &byte in &buffer[..count] {
+            if byte == b'\n' {
+                if !pending.is_empty() {
+                    let raw = String::from_utf8_lossy(pending);
+                    let printable: String = raw.chars()
+                        .map(|ch| if ch.is_control() { ' ' } else { ch })
+                        .collect();
+                    eprintln!("[AgentFlow][{name}] {}", printable.trim());
+                    pending.clear();
+                }
+            } else if pending.len() < MAX_STDERR_PREVIEW {
+                pending.push(byte);
+            }
+        }
+        if count < buffer.len() { break; }
+    }
+    Ok(())
+}
+
+fn duration_label(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    format!("{:02}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60)
+}
+
 
 pub fn run_logged(
     mut command: Command,
@@ -21,7 +61,8 @@ pub fn run_logged(
 ) -> Result<()> {
     fs::create_dir_all(dir)?;
     let stdout = fs::File::create(dir.join(format!("{name}.stdout.log")))?;
-    let stderr = fs::File::create(dir.join(format!("{name}.stderr.log")))?;
+    let stderr_path = dir.join(format!("{name}.stderr.log"));
+    let stderr = fs::File::create(&stderr_path)?;
     command.stdout(Stdio::from(stdout)).stderr(Stdio::from(stderr));
 
     // A file-backed stdin avoids blocking the supervisor on a pipe write before
@@ -40,7 +81,7 @@ pub fn run_logged(
     }
 
     let result = (|| -> Result<()> {
-        if cancel_marker.is_some_and(Path::exists) {
+        if terminal::stop_requested() || cancel_marker.is_some_and(Path::exists) {
             bail!("{name} cancelled before launch");
         }
         let mut child = command.spawn().with_context(|| format!("cannot start {name}"))?;
@@ -53,12 +94,29 @@ pub fn run_logged(
             }
         };
         let started = Instant::now();
+        let mut last_heartbeat = started;
+        let mut stderr_reader = fs::File::open(&stderr_path)?;
+        let mut stderr_pending = Vec::new();
+        eprintln!("[AgentFlow] RUNNING  {name} | PID {} | timeout {} | Ctrl+C to stop",
+            child.id(), duration_label(timeout));
         loop {
+            show_stderr_updates(&mut stderr_reader, &mut stderr_pending, name)?;
             match child.try_wait() {
                 Ok(Some(status)) => {
+                    show_stderr_updates(&mut stderr_reader, &mut stderr_pending, name)?;
+                    if !stderr_pending.is_empty() {
+                        let printable = String::from_utf8_lossy(&stderr_pending);
+                        let clean: String = printable.chars()
+                            .map(|ch| if ch.is_control() { ' ' } else { ch })
+                            .collect();
+                        eprintln!("[AgentFlow][{name}] {}", clean.trim());
+                    }
                     if !status.success() {
+                        eprintln!("[AgentFlow] FAILED   {name} | exit {status}");
                         bail!("{name} failed: {status}; inspect logs in {}", dir.display());
                     }
+                    eprintln!("[AgentFlow] DONE     {name} | elapsed {}",
+                        duration_label(started.elapsed()));
                     return Ok(());
                 }
                 Err(error) => {
@@ -68,13 +126,21 @@ pub fn run_logged(
                 Ok(None) => {}
             }
 
-            if cancel_marker.is_some_and(Path::exists) {
+            if terminal::stop_requested() || cancel_marker.is_some_and(Path::exists) {
+                eprintln!("[AgentFlow] STOPPING {name} | terminating child process tree...");
                 terminate_and_reap(&mut child, &job)?;
+                eprintln!("[AgentFlow] CANCELLED {name} | logs in {}", dir.display());
                 bail!("{name} cancelled; inspect logs in {}", dir.display());
             }
             if started.elapsed() >= timeout {
+                eprintln!("[AgentFlow] TIMEOUT  {name} | terminating child process tree...");
                 terminate_and_reap(&mut child, &job)?;
                 bail!("{name} timed out after {} seconds; inspect logs in {}", timeout.as_secs(), dir.display());
+            }
+            if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+                eprintln!("[AgentFlow] RUNNING  {name} | {} elapsed | PID {} | Ctrl+C to stop",
+                    duration_label(started.elapsed()), child.id());
+                last_heartbeat = Instant::now();
             }
             thread::sleep(POLL_INTERVAL);
         }
@@ -191,6 +257,11 @@ mod tests {
         let result = run_logged(cmd, &dir, "cancel", None, Duration::from_secs(3), Some(&marker));
         assert!(format!("{:#}", result.unwrap_err()).contains("cancelled before launch"));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn elapsed_time_is_human_readable() {
+        assert_eq!(duration_label(Duration::from_secs(3661)), "01:01:01");
     }
 
     #[cfg(windows)]
