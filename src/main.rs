@@ -242,8 +242,10 @@ impl TaskLock {
             .open(task_dir(root, id)?.join("task.lock"))?;
         match file.try_lock() {
             Ok(()) => Ok(Some(Self { file })),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-            Err(error) => Err(error).context("could not check AgentFlow task lock"),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => {
+                Err(error).context("could not check AgentFlow task lock")
+            },
         }
     }
 
