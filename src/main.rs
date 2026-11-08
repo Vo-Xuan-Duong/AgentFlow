@@ -26,8 +26,9 @@ struct Cli {
 #[derive(Subcommand)]
 enum Action {
     Doctor,
-    /// Open full-screen interactive terminal for composing tasks and controlling agents.
-    Ui,
+    /// Read-only task monitor for commands launched from Codex Desktop.
+    #[command(alias = "ui")]
+    Monitor,
     Start { #[arg(long)] request: String, #[arg(long)] plan_file: Option<PathBuf> },
     Approve { #[arg(long)] task: String },
     Run { #[arg(long)] task: String },
@@ -61,15 +62,15 @@ struct Check { name: String, program: String, #[serde(default)] args: Vec<String
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    // Like Codex CLI, bare "agentflow" opens interactive mode.
-    let action = cli.action.unwrap_or(Action::Ui);
+    // Bare "agentflow" shows a read-only monitor; work is requested in Codex Desktop.
+    let action = cli.action.unwrap_or(Action::Monitor);
     if matches!(&action, Action::Start { .. } | Action::Run { .. } | Action::Validate { .. } | Action::Review { .. }) {
         terminal::install()?;
     }
     let root = git_root(&cli.repo)?;
     match action {
         Action::Doctor => doctor(&root),
-        Action::Ui => ui::run(&root),
+        Action::Monitor => ui::run(&root),
         Action::Start { request, plan_file } => start(&root, request, plan_file.as_deref()),
         Action::Approve { task } => approve(&root, &task),
         Action::Run { task } => run(&root, &task),
