@@ -1,4 +1,5 @@
 mod process;
+mod terminal;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -57,6 +58,9 @@ struct Check { name: String, program: String, #[serde(default)] args: Vec<String
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if matches!(&cli.action, Action::Start { .. } | Action::Run { .. } | Action::Validate { .. } | Action::Review { .. }) {
+        terminal::install()?;
+    }
     let root = git_root(&cli.repo)?;
     match cli.action {
         Action::Doctor => doctor(&root),
@@ -231,11 +235,19 @@ struct TaskLock {
 }
 
 impl TaskLock {
-    fn acquire(root: &Path, id: &str) -> Result<Self> {
+    fn try_acquire(root: &Path, id: &str) -> Result<Option<Self>> {
         let file = OpenOptions::new().read(true).write(true).create(true).truncate(false)
             .open(task_dir(root, id)?.join("task.lock"))?;
-        file.try_lock().context("another AgentFlow command is already operating on this task")?;
-        Ok(Self { file })
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { file })),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error).context("could not check AgentFlow task lock"),
+        }
+    }
+
+    fn acquire(root: &Path, id: &str) -> Result<Self> {
+        Self::try_acquire(root, id)?
+            .context("another AgentFlow command is already operating on this task")
     }
 }
 
@@ -301,6 +313,9 @@ fn start(root: &Path, request: String, plan_file: Option<&Path>) -> Result<()> {
     let wt = worktree_root(root)?.join(&id);
     let dir = task_dir(root, &id)?;
     fs::create_dir_all(&dir)?;
+    // Hold the lock during planning too, so status cannot mark an active
+    // freshly-created task as interrupted.
+    let _lock = TaskLock::acquire(root, &id)?;
     fs::create_dir_all(wt.parent().context("worktree parent missing")?)?;
     let mut c = command("git", root);
     c.args(["worktree", "add", "-b", &branch]).arg(&wt).arg(&base);
@@ -367,6 +382,7 @@ fn run(root: &Path, id: &str) -> Result<()> {
     verify_plan_hash(task.approved_plan_hash.as_deref(), &plan_digest(root, &plan)?)?;
     task.state = "executing".into();
     save(&task)?;
+    eprintln!("[AgentFlow] Task {id}: EXECUTING in foreground (Ctrl+C to stop)");
     let prompt = format!(
         "Implement the approved plan in the CURRENT worktree only. \
         Do not commit, push, merge, delete files outside the plan, or modify sibling repositories. \
@@ -401,6 +417,7 @@ fn run(root: &Path, id: &str) -> Result<()> {
     }
     task.state = "executed".into();
     save(&task)?;
+    eprintln!("[AgentFlow] Task {id}: EXECUTED (no background process remains)");
     println!("Implementation in {}. Configure checks.json, then validate.", task.worktree.display());
     Ok(())
 }
@@ -417,11 +434,14 @@ fn validate(root: &Path, id: &str) -> Result<()> {
     }
     task.state = "validating".into();
     save(&task)?;
+    eprintln!("[AgentFlow] Task {id}: VALIDATING in foreground (Ctrl+C to stop)");
     for (n, check) in config.checks.iter().enumerate() {
         let mut c = command(&check.program, &task.worktree);
         c.args(&check.args);
         if let Err(e) = run_logged(c, &dir, &format!("check-{n}"), None) {
-            set_failure(&mut task, "validation_failed", &e)?;
+            let interrupted = terminal::stop_requested()
+                || dir.join("cancel.request").exists();
+            set_failure(&mut task, if interrupted { "needs_attention" } else { "validation_failed" }, &e)?;
             return Err(e);
         }
         println!("PASS {}", check.name);
@@ -438,6 +458,7 @@ fn review(root: &Path, id: &str) -> Result<()> {
     let dir = task_dir(root, id)?;
     task.state = "reviewing".into();
     save(&task)?;
+    eprintln!("[AgentFlow] Task {id}: REVIEWING in foreground (Ctrl+C to stop)");
     let mut c = command("codex", &task.worktree);
     c.args(["review", "--uncommitted"]);
     if let Err(e) = run_logged(c, &dir, "review", None) {
@@ -453,10 +474,42 @@ fn review(root: &Path, id: &str) -> Result<()> {
     Ok(())
 }
 
+fn is_running_phase(state: &str) -> bool {
+    matches!(state, "planning" | "executing" | "validating" | "reviewing")
+}
+
+/// Detect a crashed/closed foreground terminal without assuming a persisted
+/// "executing" field proves the process is still alive.
+fn inspect_active_task(root: &Path, id: &str) -> Result<(Task, bool)> {
+    let mut task = load(root, id)?;
+    if !is_running_phase(&task.state) {
+        return Ok((task, false));
+    }
+    // If the task lock is held, the owning foreground command is still alive.
+    // If it is free, reread while holding the lock before marking interrupted.
+    let Some(_lock) = TaskLock::try_acquire(root, id)? else {
+        return Ok((task, true));
+    };
+    task = load(root, id)?;
+    if is_running_phase(&task.state) {
+        let message = anyhow::anyhow!(
+            "Foreground command exited while task was {}; inspect worktree and logs before retrying",
+            task.state
+        );
+        set_failure(&mut task, "needs_attention", &message)?;
+        let cancel_marker = task_dir(root, id)?.join("cancel.request");
+        if cancel_marker.exists() {
+            fs::remove_file(cancel_marker)?;
+        }
+    }
+    Ok((task, false))
+}
+
 fn status(root: &Path, id: &str) -> Result<()> {
-    let task = load(root, id)?;
-    println!("Task: {}\nState: {}\nBranch: {}\nWorktree: {}\nArtifacts: {}",
-        task.id, task.state, task.branch, task.worktree.display(), task_dir(root, id)?.display());
+    let (task, active) = inspect_active_task(root, id)?;
+    println!("Task: {}\nState: {}\nProcess: {}\nBranch: {}\nWorktree: {}\nArtifacts: {}",
+        task.id, task.state, if active { "RUNNING (foreground)" } else { "STOPPED" },
+        task.branch, task.worktree.display(), task_dir(root, id)?.display());
     if let Some(error) = task.last_error.as_deref() {
         println!("Last error: {error}");
     }
@@ -538,5 +591,15 @@ mod tests {
     #[test]
     fn external_plan_preflight_rejects_missing_file() {
         assert!(read_external_plan(Path::new("a-file-that-must-not-exist-agentflow-plan.md")).is_err());
+    }
+
+    #[test]
+    fn only_live_phase_names_require_foreground_supervision() {
+        for state in ["planning", "executing", "validating", "reviewing"] {
+            assert!(is_running_phase(state));
+        }
+        for state in ["planned", "approved", "executed", "validated", "needs_attention", "awaiting_human_review"] {
+            assert!(!is_running_phase(state));
+        }
     }
 }
