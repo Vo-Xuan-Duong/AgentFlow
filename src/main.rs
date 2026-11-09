@@ -1,3 +1,4 @@
+mod models;
 mod process;
 mod terminal;
 mod ui;
@@ -29,6 +30,13 @@ enum Action {
     /// Read-only task monitor for commands launched from Codex Desktop.
     #[command(alias = "ui")]
     Monitor,
+    /// View or configure model overrides for AgentFlow-owned CLI invocations.
+    Models {
+        #[arg(long)] codex: Option<String>,
+        #[arg(long)] antigravity: Option<String>,
+        #[arg(long)] reset_codex: bool,
+        #[arg(long)] reset_antigravity: bool,
+    },
     Start { #[arg(long)] request: String, #[arg(long)] plan_file: Option<PathBuf> },
     Approve { #[arg(long)] task: String },
     Run { #[arg(long)] task: String },
@@ -52,6 +60,15 @@ struct Task {
     state: String,
     #[serde(default)]
     last_error: Option<String>,
+    /// The CLI model pinned for AgentFlow's own planning invocation, if any.
+    #[serde(default)]
+    planner_model: Option<String>,
+    /// The CLI model explicitly selected for this Antigravity invocation.
+    #[serde(default)]
+    executor_model: Option<String>,
+    /// The CLI model pinned for AgentFlow's code-review invocation, if any.
+    #[serde(default)]
+    review_model: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -71,6 +88,8 @@ fn main() -> Result<()> {
     match action {
         Action::Doctor => doctor(&root),
         Action::Monitor => ui::run(&root),
+        Action::Models { codex, antigravity, reset_codex, reset_antigravity } =>
+            configure_models(&root, codex, antigravity, reset_codex, reset_antigravity),
         Action::Start { request, plan_file } => start(&root, request, plan_file.as_deref()),
         Action::Approve { task } => approve(&root, &task),
         Action::Run { task } => run(&root, &task),
@@ -87,6 +106,39 @@ fn command(program: &str, cwd: &Path) -> Command {
     let mut c = Command::new(program);
     c.current_dir(cwd);
     c
+}
+
+/// Pass model IDs as *one argument*, never through a shell.
+fn add_model_arg(c: &mut Command, model: Option<&str>) {
+    if let Some(model) = model {
+        c.args(["--model", model]);
+    }
+}
+
+fn configure_models(
+    root: &Path,
+    codex: Option<String>,
+    antigravity: Option<String>,
+    reset_codex: bool,
+    reset_antigravity: bool,
+) -> Result<()> {
+    if (codex.is_some() && reset_codex) || (antigravity.is_some() && reset_antigravity) {
+        bail!("cannot set and reset the same model in one command");
+    }
+    let mut settings = models::load(root)?;
+    let changed = codex.is_some() || antigravity.is_some() || reset_codex || reset_antigravity;
+    if reset_codex { settings.codex_cli = None; }
+    if reset_antigravity { settings.antigravity = None; }
+    if let Some(model) = codex { settings.codex_cli = Some(model); }
+    if let Some(model) = antigravity { settings.antigravity = Some(model); }
+    if changed { models::save(root, &settings)?; }
+
+    println!("Model config: {}", models::path(root)?.display());
+    println!("Codex CLI: {}", settings.codex_cli.as_deref().unwrap_or("not pinned (Codex CLI default)"));
+    println!("Antigravity CLI: {}", settings.antigravity.as_deref().unwrap_or("not pinned (agy default)"));
+    println!("Codex Desktop: external app; select its model inside Codex Desktop");
+    if changed { println!("Saved. Changes apply to future CLI invocations, not running tasks."); }
+    Ok(())
 }
 
 fn capture(mut cmd: Command) -> Result<String> {
@@ -314,6 +366,12 @@ fn start(root: &Path, request: String, plan_file: Option<&Path>) -> Result<()> {
     if request.trim().is_empty() { bail!("request is empty"); }
     // Validate plan before creating any Git worktree or state.
     let external_plan = plan_file.map(read_external_plan).transpose()?;
+    // When Codex Desktop supplied --plan-file, no Codex CLI planner runs.
+    let planner_model = if external_plan.is_none() {
+        models::load(root)?.codex_cli
+    } else {
+        None
+    };
     if !git(root, &["status", "--porcelain"])?.is_empty() {
         bail!("repository is dirty; commit/stash your changes before starting");
     }
@@ -331,7 +389,8 @@ fn start(root: &Path, request: String, plan_file: Option<&Path>) -> Result<()> {
     let mut c = command("git", root);
     c.args(["worktree", "add", "-b", &branch]).arg(&wt).arg(&base);
     run_logged(c, &dir, "worktree", None)?;
-    let mut task = Task { id, request, root: root.to_owned(), worktree: wt, branch, base, approved_plan_hash: None, state: "planning".into(), last_error: None };
+    let mut task = Task { id, request, root: root.to_owned(), worktree: wt, branch, base, approved_plan_hash: None, state: "planning".into(), last_error: None,
+        planner_model, executor_model: None, review_model: None };
     save(&task)?;
     fs::write(dir.join("checks.json"), "{\n  \"checks\": []\n}\n")?;
     if let Some(plan) = external_plan {
@@ -356,7 +415,9 @@ fn start(root: &Path, request: String, plan_file: Option<&Path>) -> Result<()> {
         task.request
     );
     let mut c = command("codex", &task.worktree);
-    c.args(["exec", "--sandbox", "read-only", "-o"]).arg(dir.join("plan.md")).arg("-");
+    c.arg("exec");
+    add_model_arg(&mut c, task.planner_model.as_deref());
+    c.args(["--sandbox", "read-only", "-o"]).arg(dir.join("plan.md")).arg("-");
     if let Err(e) = run_logged(c, &dir, "planner", Some(&prompt)) {
         set_failure(&mut task, "needs_attention", &e)?;
         return Err(e);
@@ -395,6 +456,9 @@ fn run(root: &Path, id: &str) -> Result<()> {
     let dir = task_dir(root, id)?;
     let plan = fs::read_to_string(dir.join("plan.md"))?;
     verify_plan_hash(task.approved_plan_hash.as_deref(), &plan_digest(root, &plan)?)?;
+    // Snapshot the requested model *before* launching. A later edit to the
+    // monitor config never changes the already running agent.
+    task.executor_model = models::load(root)?.antigravity;
     task.state = "executing".into();
     save(&task)?;
     
@@ -408,6 +472,7 @@ fn run(root: &Path, id: &str) -> Result<()> {
     );
     let mut c = command("agy", &task.worktree);
     c.args(["-p", &prompt, "--output-format", "json", "--print-timeout", "30m"]);
+    add_model_arg(&mut c, task.executor_model.as_deref());
     if let Err(e) = run_logged(c, &dir, "executor", None) {
         set_failure(&mut task, "needs_attention", &e)?;
         return Err(e);
@@ -477,13 +542,16 @@ fn review(root: &Path, id: &str) -> Result<()> {
     let mut task = load(root, id)?;
     require(&task, "validated")?;
     let dir = task_dir(root, id)?;
+    task.review_model = models::load(root)?.codex_cli;
     task.state = "reviewing".into();
     save(&task)?;
     
         eprintln!("[AgentFlow] Task {id}: REVIEWING in foreground (Ctrl+C to stop)");
     
     let mut c = command("codex", &task.worktree);
-    c.args(["review", "--uncommitted"]);
+    c.arg("review");
+    add_model_arg(&mut c, task.review_model.as_deref());
+    c.arg("--uncommitted");
     if let Err(e) = run_logged(c, &dir, "review", None) {
         set_failure(&mut task, "needs_attention", &e)?;
         return Err(e);
@@ -538,6 +606,9 @@ fn status(root: &Path, id: &str) -> Result<()> {
     if let Some(error) = task.last_error.as_deref() {
         println!("Last error: {error}");
     }
+    if let Some(model) = task.planner_model.as_deref() { println!("Planner CLI requested model: {model}"); }
+    if let Some(model) = task.executor_model.as_deref() { println!("Antigravity requested model: {model}"); }
+    if let Some(model) = task.review_model.as_deref() { println!("Codex review requested model: {model}"); }
     if task_dir(root, id)?.join("cancel.request").exists() {
         println!("Cancellation requested");
     }
@@ -614,6 +685,19 @@ mod tests {
     }
 
     #[test]
+    fn subprocess_model_arg_is_opt_in() {
+        let mut codex = command("codex", Path::new("."));
+        codex.arg("exec");
+        add_model_arg(&mut codex, Some("gpt-6.1-sol"));
+        let args: Vec<String> = codex.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, ["exec", "--model", "gpt-6.1-sol"]);
+
+        let mut agy = command("agy", Path::new("."));
+        add_model_arg(&mut agy, None);
+        assert_eq!(agy.get_args().count(), 0);
+    }
+
+    #[test]
     fn external_plan_preflight_rejects_missing_file() {
         assert!(read_external_plan(Path::new("a-file-that-must-not-exist-agentflow-plan.md")).is_err());
     }
@@ -648,6 +732,9 @@ mod tests {
             approved_plan_hash: None,
             state: "executing".into(),
             last_error: None,
+            planner_model: None,
+            executor_model: None,
+            review_model: None,
         };
         save(&task).unwrap();
 
