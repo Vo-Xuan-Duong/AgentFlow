@@ -115,7 +115,7 @@ fn scan(root: &Path) -> Result<Vec<Snapshot>> {
     Ok(tasks)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ModelField {
     CodexCli,
     Antigravity,
