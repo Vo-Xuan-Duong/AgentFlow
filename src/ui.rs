@@ -336,18 +336,101 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
         &mut selection,
     );
 
-    detail(frame, columns[1], app);
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(10), Constraint::Length(12)])
+        .split(columns[1]);
+    detail(frame, right[0], app);
+    model_panel(frame, right[1], app);
 
     let footer_text = if let Some(error) = &app.message {
-        format!(" {error}    ↑/↓ Select  ·  R Refresh  ·  Q/Esc Exit")
+        format!(" {error}    M Edit models · Q Exit")
+    } else if app.editor.is_some() {
+        " Model editor: Tab switch · Enter save · Delete reset · Esc cancel".to_owned()
     } else {
-        " Status only — type requests in Codex Desktop     ↑/↓ Select  ·  R Refresh  ·  Q/Esc Exit".to_owned()
+        " Status only — Codex Desktop handles requests · M Models · R Refresh · Q/Esc Exit".to_owned()
     };
     frame.render_widget(
         Paragraph::new(footer_text)
             .style(Style::default().fg(MUTED))
             .block(Block::default().borders(Borders::ALL)),
         layout[2],
+    );
+}
+
+fn display_model(slug: Option<&str>) -> String {
+    slug.map_or_else(|| "CLI default (not verified)".to_owned(), str::to_owned)
+}
+
+fn model_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if let Some(editor) = &app.editor {
+        lines.push(Line::from(Span::styled(
+            "Edit model slug — affects future CLI launches only",
+            Style::default().fg(GOLD),
+        )));
+        lines.push(Line::from(""));
+        let codex_label = if editor.selected == ModelField::CodexCli { "> " } else { "  " };
+        let agy_label = if editor.selected == ModelField::Antigravity { "> " } else { "  " };
+        let codex = if editor.codex.is_empty() { "(CLI default)" } else { &editor.codex };
+        let agy = if editor.antigravity.is_empty() { "(CLI default)" } else { &editor.antigravity };
+        lines.push(Line::from(Span::styled(
+            format!("{codex_label}Codex CLI   {}", truncate_chars(codex, 70)),
+            Style::default().fg(if editor.selected == ModelField::CodexCli { CYAN } else { MUTED }),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("{agy_label}Antigravity {}", truncate_chars(agy, 70)),
+            Style::default().fg(if editor.selected == ModelField::Antigravity { CYAN } else { MUTED }),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from("Tab switch · Type slug · Backspace edit"));
+        lines.push(Line::from("Delete clear · Enter save · Esc cancel"));
+        lines.push(Line::from(Span::styled(
+            "Codex Desktop model must be selected in Codex Desktop.",
+            Style::default().fg(GOLD),
+        )));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("Codex Desktop     ", Style::default().fg(MUTED)),
+            Span::raw("selected inside app; cannot inspect"),
+        ]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("Codex CLI        ", Style::default().fg(CYAN)),
+            Span::raw(display_model(app.models.codex_cli.as_deref())),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Antigravity      ", Style::default().fg(CYAN)),
+            Span::raw(display_model(app.models.antigravity.as_deref())),
+        ]));
+        if let Some(snapshot) = app.selected() {
+            if let Some(model) = snapshot.task.executor_model.as_deref() {
+                lines.push(Line::from(format!(
+                    "Task agy requested: {}", truncate_chars(model, 64)
+                )));
+            }
+            if let Some(model) = snapshot.task.planner_model.as_deref()
+                .or(snapshot.task.review_model.as_deref())
+            {
+                lines.push(Line::from(format!(
+                    "Task Codex CLI: {}", truncate_chars(model, 64)
+                )));
+            }
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "[M] Edit models · not a chat or task editor",
+            Style::default().fg(GOLD),
+        )));
+        lines.push(Line::from("Antigravity model names: agy models"));
+        lines.push(Line::from("Saved per repo outside the Git worktree."));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().title(" Models · next CLI invocations ").borders(Borders::ALL)
+                .border_style(Style::default().fg(if app.editor.is_some() { CYAN } else { MUTED })))
+            .wrap(Wrap { trim: false }),
+        area,
     );
 }
 
@@ -446,15 +529,24 @@ pub fn run(root: &Path) -> Result<()> {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
-                if matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
-                    || (key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::CONTROL))
+                if key.code == KeyCode::Char('c')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
                 {
+                    break;
+                }
+                if app.editor.is_some() {
+                    app.handle_model_key(key.code);
+                    continue;
+                }
+                if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                     break;
                 }
                 match key.code {
                     KeyCode::Up => app.move_selection(-1),
                     KeyCode::Down => app.move_selection(1),
+                    KeyCode::Char('m') => {
+                        app.editor = Some(ModelEditor::from_settings(&app.models));
+                    }
                     KeyCode::Char('r') | KeyCode::F(5) => app.refresh(),
                     _ => {}
                 }
@@ -494,7 +586,26 @@ mod tests {
             approved_plan_hash: None,
             state: "executing".into(),
             last_error: None,
+            planner_model: None,
+            executor_model: None,
+            review_model: None,
         }), "Antigravity is writing code");
+    }
+
+    #[test]
+    fn editor_starts_with_current_settings_and_can_reset_a_model() {
+        let source = ModelSettings {
+            codex_cli: Some("gpt-6.1-sol".into()),
+            antigravity: Some("gemini-3.8-flash-medium".into()),
+        };
+        let mut editor = ModelEditor::from_settings(&source);
+        assert_eq!(editor.selected, ModelField::Antigravity);
+        editor.selected_mut().clear();
+        let updated = editor.settings();
+        assert!(updated.antigravity.is_none());
+        assert_eq!(updated.codex_cli.as_deref(), Some("gpt-6.1-sol"));
+        editor.switch();
+        assert_eq!(editor.selected, ModelField::CodexCli);
     }
 
     #[test]
@@ -525,6 +636,9 @@ mod tests {
             approved_plan_hash: None,
             state: "executing".into(),
             last_error: None,
+            planner_model: None,
+            executor_model: None,
+            review_model: None,
         };
         let lock_path = task_dir(&root, &task.id).unwrap().join("task.lock");
         assert!(!lock_path.exists());
