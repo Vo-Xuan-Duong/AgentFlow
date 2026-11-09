@@ -51,14 +51,23 @@ show the tasks and whether the real CLI subprocess is active.
    ```
    Only AgentFlow invokes `agy` to edit files in the isolated worktree.
    Keep the command connected until it ends; never launch a detached process.
-6. Inspect the CLI exit status, `agentflow status`, changed files in the
+6. Before dispatch, you may inspect the per-project model pins via
+   `agentflow --repo "<target-repo>" models`. AgentFlow pins the configured
+   Antigravity model with `--model` when it launches `agy`. Users can change
+   this pin in the optional monitor's Models panel (`M`), or with
+   `agentflow models --antigravity <slug>`. Retrieve valid Antigravity IDs
+   using `agy models`. The Codex CLI model pin applies only to AgentFlow's
+   CLI planning/review invocations; it **cannot** change or report the active
+   Codex Desktop conversation model. The model selection is not an approval
+   to begin implementation.
+7. Inspect the CLI exit status, `agentflow status`, changed files in the
    reported worktree, and `executor.stdout.log` / `executor.stderr.log`.
    Do not claim completion solely from `agy` returning exit code zero.
-7. Prepare project-specific, non-destructive checks in the task artifact's
+8. Prepare project-specific, non-destructive checks in the task artifact's
    `checks.json`, after reviewing the exact commands. Call `agentflow
    validate --task "<id>"` and report actual results. Codex can read the
    diff for a report if the user wants one, but must not edit source code.
-8. Report the result in the **same Codex Desktop conversation**: task ID,
+9. Report the result in the **same Codex Desktop conversation**: task ID,
    worktree path, status, tests, errors and recommended next action.
    Do not silently commit, push, merge, reset or remove worktrees.
 
