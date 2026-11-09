@@ -1,7 +1,7 @@
 //! Read-only terminal monitor for commands launched from Codex Desktop.
 //! This process neither starts agents nor owns their process trees.
 //! Closing the monitor must never stop a Codex-launched AgentFlow task.
-use crate::{load, state_root, task_dir, Task};
+use crate::{load, models::{self, ModelSettings}, state_root, task_dir, Task};
 use anyhow::{Context, Result};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -115,10 +115,55 @@ fn scan(root: &Path) -> Result<Vec<Snapshot>> {
     Ok(tasks)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModelField {
+    CodexCli,
+    Antigravity,
+}
+
+struct ModelEditor {
+    codex: String,
+    antigravity: String,
+    selected: ModelField,
+}
+
+impl ModelEditor {
+    fn from_settings(settings: &ModelSettings) -> Self {
+        Self {
+            codex: settings.codex_cli.clone().unwrap_or_default(),
+            antigravity: settings.antigravity.clone().unwrap_or_default(),
+            selected: ModelField::Antigravity,
+        }
+    }
+
+    fn selected_mut(&mut self) -> &mut String {
+        match self.selected {
+            ModelField::CodexCli => &mut self.codex,
+            ModelField::Antigravity => &mut self.antigravity,
+        }
+    }
+
+    fn settings(&self) -> ModelSettings {
+        ModelSettings {
+            codex_cli: if self.codex.is_empty() { None } else { Some(self.codex.clone()) },
+            antigravity: if self.antigravity.is_empty() { None } else { Some(self.antigravity.clone()) },
+        }
+    }
+
+    fn switch(&mut self) {
+        self.selected = match self.selected {
+            ModelField::CodexCli => ModelField::Antigravity,
+            ModelField::Antigravity => ModelField::CodexCli,
+        };
+    }
+}
+
 struct App {
     root: PathBuf,
     tasks: Vec<Snapshot>,
     selected: Option<String>,
+    models: ModelSettings,
+    editor: Option<ModelEditor>,
     last_refresh: Instant,
     message: Option<String>,
 }
@@ -129,6 +174,8 @@ impl App {
             root: root.to_owned(),
             tasks: Vec::new(),
             selected: None,
+            models: ModelSettings::default(),
+            editor: None,
             last_refresh: Instant::now(),
             message: None,
         };
@@ -138,6 +185,13 @@ impl App {
 
     fn refresh(&mut self) {
         self.last_refresh = Instant::now();
+        match models::load(&self.root) {
+            Ok(settings) => {
+                self.models = settings;
+                self.message = None;
+            }
+            Err(error) => self.message = Some(format!("Model config: {error:#}")),
+        }
         match scan(&self.root) {
             Ok(tasks) => {
                 if self
@@ -148,7 +202,6 @@ impl App {
                     self.selected = tasks.first().map(|snapshot| snapshot.task.id.clone());
                 }
                 self.tasks = tasks;
-                self.message = None;
             }
             Err(error) => self.message = Some(format!("Cannot refresh task status: {error:#}")),
         }
@@ -173,6 +226,47 @@ impl App {
 
     fn running_count(&self) -> usize {
         self.tasks.iter().filter(|snapshot| snapshot.activity == Activity::Running).count()
+    }
+
+    fn save_editor(&mut self) {
+        let Some(editor) = self.editor.as_ref() else { return; };
+        let requested = editor.settings();
+        match models::save(&self.root, &requested) {
+            Ok(()) => {
+                self.models = requested;
+                self.editor = None;
+                self.message = Some(
+                    "Models saved. Future invocations only; Codex Desktop model is separate.".into()
+                );
+            }
+            Err(error) => self.message = Some(format!("Could not save models: {error:#}")),
+        }
+    }
+
+    fn handle_model_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                self.editor = None;
+                self.message = Some("Model edit cancelled".into());
+            }
+            KeyCode::Tab => {
+                if let Some(editor) = &mut self.editor { editor.switch(); }
+            }
+            KeyCode::Enter => self.save_editor(),
+            KeyCode::Backspace => {
+                if let Some(editor) = &mut self.editor { editor.selected_mut().pop(); }
+            }
+            KeyCode::Delete => {
+                if let Some(editor) = &mut self.editor { editor.selected_mut().clear(); }
+            }
+            KeyCode::Char(ch) if ch.is_ascii() && !ch.is_ascii_control() => {
+                if let Some(editor) = &mut self.editor {
+                    let target = editor.selected_mut();
+                    if target.len() < 128 { target.push(ch); }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
