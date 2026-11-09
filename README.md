@@ -256,3 +256,65 @@ authenticated and compatible with AgentFlow's headless flags. A clean Git
 repository and explicit plan approval are required. Real Codex Desktop →
 Antigravity integration requires a manual test on Windows; CI only verifies
 build, lint and unit tests. Agent worktrees are not security sandboxes.
+
+
+## Per-project Models panel
+
+AgentFlow's terminal monitor now shows a separate **Models** panel below task
+status. The terminal remains a task **viewer**, not a second chat interface.
+
+- **Codex Desktop:** current session model is **not exposed** to AgentFlow.
+  Change it inside Codex Desktop's model picker. AgentFlow does not claim to
+  detect or override the running Desktop session.
+- **Codex CLI:** optional pinned `--model` for planner/reviewer commands that
+  **AgentFlow launches**. If Codex Desktop used `start --plan-file`, no
+  Codex CLI planner is launched. The CLI default can differ from Desktop.
+- **Antigravity CLI:** optional pinned `--model` for `agy -p` executor.
+  Use `agy models` to see the **real** available model identifiers.
+
+### Edit in the monitor
+
+Open your monitored project:
+
+```cmd
+"D:\Projects\AgentFlow\target\release\agentflow.exe" --repo "D:\Projects\MyApplication" monitor
+```
+
+Press `M` to edit model pins, `Tab` to switch between Codex CLI and
+Antigravity, type the exact model slug, then press `Enter` to save.
+`Backspace` edits, `Delete` clears a pin and returns to the CLI's default,
+and `Esc` discards unsaved changes. Press `R` to refresh the monitor.
+
+The model override file is stored in
+`<project-parent>/.agentflow-state/<project-name>/models.json`. It is kept
+**outside the Git repository** and is independent of Codex Desktop settings.
+No credentials or tokens are saved in this file.
+
+### Change models using CMD or Codex Desktop's terminal
+
+```cmd
+set "AF=D:\Projects\AgentFlow\target\release\agentflow.exe"
+set "REPO=D:\Projects\MyApplication"
+
+agy models
+"%AF%" --repo "%REPO%" models
+"%AF%" --repo "%REPO%" models --antigravity gemini-3.8-flash-medium
+"%AF%" --repo "%REPO%" models --codex gpt-6.1-sol
+"%AF%" --repo "%REPO%" models --reset-antigravity --reset-codex
+```
+
+The example model identifiers are *illustrations*, not guaranteed to be
+available for your account. Select real IDs reported by your installed CLI.
+AgentFlow validates the model identifier syntax locally and passes it to each
+CLI as a separate argument; the CLI then verifies actual model availability.
+An unavailable model may cause the CLI to fail without editing code.
+
+When a task begins an agent phase, AgentFlow records its **requested model**
+in task metadata. The panel distinguishes the model pinned for **future**
+runs from model IDs requested by an already started task. It cannot prove
+which model the external service ultimately executed unless the CLI exposes
+that in a trusted response.
+
+This feature does **not** change the model selected in the Codex Desktop
+chat. It also does not change models mid-task. Existing worktrees, approval
+gates, logs and manual validation are preserved.
